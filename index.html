@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="referrer" content="no-referrer">
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  >
+  <title>Verificación Super Sus SA Server</title>
+  <link rel="stylesheet" href="assets/css/styles.css">
+</head>
+<body class="verification-page-body">
+  <main class="verification-layout">
+    <section id="verification-panel" class="verification-card" aria-labelledby="page-title">
+      <div class="card-brand">
+        <img
+          class="brand-avatar"
+          src="assets/images/verification-icon.png"
+          alt=""
+          width="42"
+          height="42"
+        >
+        <span>Verificación Super Sus SA Server</span>
+      </div>
+
+      <p class="eyebrow">Acceso a la comunidad</p>
+      <h1 id="page-title">Verifica tu cuenta</h1>
+      <p class="lead">Comprobaremos tu solicitud para identificar la veracidad y autenticidad de la cuenta.</p>
+
+      <div id="link-warning" class="notice notice-error is-hidden" role="alert">
+        <strong>Enlace no válido</strong>
+        <p>Regresa a Discord y genera uno nuevo.</p>
+      </div>
+
+      <div class="privacy-inline">
+        <span>Revisa cómo gestionamos esta solicitud.</span>
+        <a href="privacy.html" target="_blank" rel="noopener noreferrer">Privacidad</a>
+      </div>
+
+      <label class="consent-control" for="privacy-consent">
+        <input id="privacy-consent" type="checkbox">
+        <span>He leído el aviso y acepto continuar con la verificación.</span>
+      </label>
+
+      <div id="status-message" class="status-message is-hidden" role="status" aria-live="polite"></div>
+
+      <button id="start-verification" class="primary-action" type="button" disabled>
+        <span aria-hidden="true">✓</span>
+        Iniciar verificación
+      </button>
+
+      <p class="security-note">Nunca te pediremos tu contraseña de Discord.</p>
+    </section>
+
+    <section id="success-panel" class="verification-card result-panel is-hidden" aria-labelledby="success-title">
+      <div class="result-mark" aria-hidden="true">✓</div>
+      <p class="eyebrow">Solicitud enviada</p>
+      <h1 id="success-title">Solicitud de Verificación Realizada</h1>
+      <p>Vuelve al servidor de Discord para consultar el resultado de tu verificación.</p>
+      <p class="result-note">Ya puedes cerrar esta página.</p>
+    </section>
+  </main>
+
+  <script src="assets/js/config.js"></script>
+  <script src="assets/js/app.js"></script>
+</body>
+</html>
