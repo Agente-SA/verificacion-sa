@@ -52,6 +52,16 @@ body > * {
   z-index: 1;
 }
 
+body.privacy-page {
+  background-image: url("../images/privacy-background.png");
+  background-position: center bottom;
+  background-size: cover;
+}
+
+body.privacy-page::before {
+  background: rgba(1, 3, 18, 0.4);
+}
+
 a {
   color: var(--cyan);
   font-weight: 700;
@@ -357,20 +367,6 @@ h2 {
   margin-bottom: 0;
 }
 
-.legal-callout {
-  margin-top: 22px;
-  padding: 20px;
-  border: 1px solid rgba(113, 239, 255, 0.24);
-  border-left: 4px solid var(--cyan);
-  border-radius: 8px;
-  background: var(--panel-strong);
-}
-
-.legal-callout p {
-  margin-bottom: 0;
-  color: #cbd4e1;
-}
-
 .site-footer {
   border-top-style: solid;
   border-top-width: 1px;
@@ -386,6 +382,11 @@ h2 {
   font-size: 13px;
 }
 
+.privacy-page .footer-inner {
+  justify-content: center;
+  text-align: center;
+}
+
 @media (max-width: 760px) {
   body {
     background-position: center;
@@ -394,6 +395,10 @@ h2 {
 
   body::before {
     background: rgba(1, 4, 22, 0.46);
+  }
+
+  body.privacy-page::before {
+    background: rgba(1, 3, 18, 0.54);
   }
 
   .verification-layout {
@@ -492,6 +497,10 @@ h2 {
     justify-content: center;
     gap: 4px;
     padding-block: 12px;
+  }
+
+  .privacy-page .footer-inner {
+    align-items: center;
   }
 }
 
