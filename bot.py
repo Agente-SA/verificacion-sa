@@ -75,7 +75,8 @@ bot = VerificationBot()
 
 @bot.event
 async def on_ready() -> None:
-    print(f"Bot de Verificación SA conectado como {bot.user}")
+    print(f"🛡️ Guardian SUS conectado correctamente como {bot.user}")
+    print("✅ Enlace con Discord establecido. Sistema de verificación listo.")
 
 
 if __name__ == "__main__":
@@ -83,4 +84,5 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    bot.run(DISCORD_TOKEN)
+    logging.getLogger("discord").setLevel(logging.WARNING)
+    bot.run(DISCORD_TOKEN, log_handler=None)
