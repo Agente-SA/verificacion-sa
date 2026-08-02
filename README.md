@@ -1,52 +1,86 @@
-# Verificación SA - Frontend
+# Verificacion Super Sus SA
 
-Interfaz estática del sistema de verificación de la comunidad Super Sus SA.
+Aplicacion independiente que contiene el bot de Discord, la API HTTP de
+verificacion y el frontend estatico publicado mediante GitHub Pages.
 
-## Responsabilidad del repositorio
+## Componentes
 
-Este repositorio contiene únicamente archivos públicos para GitHub Pages:
+- `bot.py`: arranque del bot, sincronizacion de comandos y ciclo de retencion.
+- `modules/verificacion.py`: panel, enlaces personales y comandos de staff.
+- `api/verification_api.py`: endpoint publico consumido por el frontend.
+- `core/database.py`: tablas y consultas exclusivas de verificacion en Neon.
+- `core/verification_security.py`: tokens HMAC y hashes de privacidad.
+- `core/verification_risk.py`: evaluacion de coincidencias y riesgo.
+- `core/vpn_detection.py`: consultas a proxycheck.io e ipapi.is.
+- `index.html`, `privacy.html` y `assets/`: frontend de GitHub Pages.
 
-- Aviso de privacidad y consentimiento.
-- Lectura del token temporal desde el fragmento de la URL.
-- Recopilación de señales técnicas limitadas después del consentimiento.
-- Envío de la solicitud a la API de Square Cloud.
-- Pantalla final genérica.
+## Intents y permisos
 
-No contiene secretos, conexión directa con PostgreSQL, lógica de riesgo ni credenciales de Discord.
+El bot solo activa el intent estandar `guilds`. Los intents privilegiados
+`members`, `message_content` y `presences` deben permanecer desactivados en el
+codigo y en Discord Developer Portal.
 
-## Configuración local
+Permisos de servidor requeridos:
 
-La URL pública de la API se define en `assets/js/config.js`:
+- View Channels
+- Send Messages
+- Embed Links
+- Read Message History
+- Manage Roles
+- Use Application Commands
 
-```js
-window.VERIFICATION_CONFIG = Object.freeze({
-  apiBaseUrl: "https://api.example.com",
-  requestTimeoutMs: 15000
-});
-```
+El rol del bot debe estar por encima del rol configurado en
+`VERIFIED_ROLE_ID`.
 
-La URL permanecerá vacía hasta desplegar la API en Square Cloud.
+## Variables de entorno
 
-## Prueba visual
+Square Cloud debe inyectar las variables; no se debe subir un archivo `.env`.
+La lista completa se encuentra en `.env.example`.
 
-Abre `index.html` con un token de prueba en el fragmento:
+La URL de Neon puede copiarse completa. La aplicacion retira automaticamente
+`channel_binding`, que no es una opcion de conexion reconocida por `asyncpg`, y
+conserva `sslmode=require`.
 
-```text
-index.html#token=token_de_prueba_1234567890
-```
+`STAFF_ROLE_IDS` acepta uno o varios IDs separados por comas. El propietario
+del servidor tambien puede ejecutar los comandos de staff.
 
-La interfaz permitirá revisar el consentimiento, pero no enviará datos mientras `apiBaseUrl` esté vacío.
-
-## Publicación posterior
-
-Cuando el repositorio remoto esté creado:
+Los secretos se generan por separado:
 
 ```bash
-git branch -M main
-git remote add origin URL_DEL_REPOSITORIO
-git add .
-git commit -m "Crea frontend inicial de verificacion"
-git push -u origin main
+python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Después se habilitará GitHub Pages desde la rama `main` y la carpeta raíz.
+No reutilices `TOKEN_SECRET`. Para conservar coincidencias historicas durante
+una migracion, `IP_HASH_SECRET` debe ser el mismo que genero los hashes
+anteriores; si se cambia, la nueva base debe comenzar sin esos hashes.
+
+## Desarrollo local
+
+```bash
+python -m venv .venv
+source .venv/Scripts/activate
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python bot.py
+```
+
+## GitHub Pages
+
+Publica la rama `main` desde la carpeta raiz. El token permanece en el
+fragmento `#token=...`, que no se envia a GitHub Pages.
+
+La URL publica de Square Cloud se configura en `assets/js/config.js`.
+
+## Square Cloud
+
+1. Importa este repositorio desde GitHub.
+2. Selecciona `bot.py` como archivo principal.
+3. Asigna al menos 512 MB y el entorno Python recomendado.
+4. Inyecta todas las variables de `.env.example`.
+5. Activa Publicacion en la Web y asigna un subdominio.
+6. Conserva `HOST=0.0.0.0` y `PORT=80`.
+7. Despliega y comprueba `https://SUBDOMINIO.squareweb.app/health`.
+8. Actualiza `assets/js/config.js` con ese origen HTTPS y vuelve a publicar
+   GitHub Pages.
+
+El servicio no inicia si falta PostgreSQL, un secreto o una variable critica.
