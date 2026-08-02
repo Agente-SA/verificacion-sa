@@ -1,0 +1,42 @@
+name: Deploy Guardian SUS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guardian-sus-production
+  cancel-in-progress: false
+
+jobs:
+  test-and-deploy:
+    name: Test and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run verification tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Deploy to Square Cloud
+        uses: squarecloudofc/github-action@v2
+        with:
+          token: ${{ secrets.SQUARE_TOKEN }}
+          command: commit ${{ secrets.SQUARE_APPLICATION_ID }} --restart
