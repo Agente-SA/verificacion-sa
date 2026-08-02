@@ -58,7 +58,9 @@ class InvalidSubmission(ValueError):
 
 
 class RoleGrantError(RuntimeError):
-    pass
+    def __init__(self, message: str, diagnostics: str | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 def _frontend_origin() -> str:
@@ -201,26 +203,91 @@ async def _get_member(bot, guild_id: int, user_id: int):
         return None
 
 
+def _effective_permissions(roles: list[discord.Role]) -> discord.Permissions:
+    permissions = discord.Permissions.none()
+    for role in roles:
+        permissions.value |= role.permissions.value
+    if permissions.administrator:
+        return discord.Permissions.all()
+    return permissions
+
+
+def _role_grant_diagnostics(
+    guild: discord.Guild,
+    member: discord.Member,
+    bot_member: discord.Member,
+    role: discord.Role,
+    bot_roles: list[discord.Role],
+) -> str:
+    bot_top_role = max(bot_roles) if bot_roles else guild.default_role
+    permissions = _effective_permissions(bot_roles)
+    target_top_role = member.top_role
+    return (
+        f"Servidor: `{guild.id}`\n"
+        f"Bot: {bot_member.mention} (`{bot_member.id}`)\n"
+        f"Rol superior del bot: {bot_top_role.mention} "
+        f"(`{bot_top_role.id}`, posicion `{bot_top_role.position}`)\n"
+        f"Rol verificado: {role.mention} "
+        f"(`{role.id}`, posicion `{role.position}`, managed=`{role.managed}`)\n"
+        f"Manage Roles: `{permissions.manage_roles}` | "
+        f"Administrator: `{permissions.administrator}`\n"
+        f"Usuario objetivo: {member.mention} (`{member.id}`) | "
+        f"rol superior `{target_top_role.name}` (`{target_top_role.id}`) | "
+        f"owner=`{guild.owner_id == member.id}` | pending=`{member.pending}`"
+    )
+
+
 async def _grant_verified_role(member: discord.Member) -> bool:
     guild = member.guild
-    role = guild.get_role(VERIFIED_ROLE_ID)
-    bot_member = guild.me
+    cached_bot_member = guild.me
+    if cached_bot_member is None:
+        raise RoleGrantError("No se pudo localizar al bot dentro del servidor.")
+
+    try:
+        roles = await guild.fetch_roles()
+        fresh_member = await guild.fetch_member(member.id)
+        bot_member = await guild.fetch_member(cached_bot_member.id)
+    except discord.HTTPException as exc:
+        raise RoleGrantError(
+            f"No se pudo actualizar el estado del servidor antes de asignar el rol: {exc}"
+        ) from exc
+
+    role = discord.utils.get(roles, id=VERIFIED_ROLE_ID)
     if role is None or role.managed or role.id == guild.id:
         raise RoleGrantError("El rol verificado no existe o no es asignable.")
-    if bot_member is None:
-        raise RoleGrantError("No se pudo localizar al bot dentro del servidor.")
-    permissions = bot_member.guild_permissions
+
+    bot_role_ids = {cached_role.id for cached_role in bot_member.roles}
+    bot_roles = [fresh_role for fresh_role in roles if fresh_role.id in bot_role_ids]
+    diagnostics = _role_grant_diagnostics(
+        guild,
+        fresh_member,
+        bot_member,
+        role,
+        bot_roles,
+    )
+    permissions = _effective_permissions(bot_roles)
     if not (permissions.administrator or permissions.manage_roles):
-        raise RoleGrantError("El bot no posee el permiso Manage Roles.")
-    if bot_member.top_role <= role:
-        raise RoleGrantError("El rol del bot no esta por encima del rol verificado.")
-    if member.get_role(role.id) is not None:
+        raise RoleGrantError(
+            "El bot no posee el permiso Manage Roles.",
+            diagnostics,
+        )
+
+    bot_top_role = max(bot_roles) if bot_roles else guild.default_role
+    if bot_top_role <= role:
+        raise RoleGrantError(
+            "El rol del bot no esta por encima del rol verificado.",
+            diagnostics,
+        )
+    if fresh_member.get_role(role.id) is not None:
         return False
 
-    await member.add_roles(
-        role,
-        reason="Verificacion SA aprobada automaticamente",
-    )
+    try:
+        await fresh_member.add_roles(
+            role,
+            reason="Verificacion SA aprobada automaticamente",
+        )
+    except discord.HTTPException as exc:
+        raise RoleGrantError(str(exc), diagnostics) from exc
     return True
 
 
@@ -380,6 +447,7 @@ async def _send_role_error_alert(
     member: discord.Member,
     attempt_id: int,
     reason: str,
+    diagnostics: str | None = None,
 ) -> None:
     channel = await _staff_channel(bot)
     if channel is None:
@@ -394,6 +462,12 @@ async def _send_role_error_alert(
         color=discord.Color.red(),
         timestamp=datetime.now(timezone.utc),
     )
+    if diagnostics:
+        embed.add_field(
+            name="Diagnostico de permisos",
+            value=diagnostics[:1024],
+            inline=False,
+        )
     await channel.send(embed=embed)
 
 
@@ -680,6 +754,7 @@ def create_verification_app(bot) -> web.Application:
                     member,
                     attempt["id"],
                     str(exc),
+                    getattr(exc, "diagnostics", None),
                 )
             except Exception:
                 logger.exception(

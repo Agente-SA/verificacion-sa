@@ -415,7 +415,7 @@ class VerificationManager:
                 "verify.png"
             )
         )
-        embed.set_footer(text="Desarrollado por Agente SUS")
+        embed.set_footer(text="Desarrollado por Super Sus SA Oficial")
         return embed
 
     async def issue_personal_link(self, interaction: discord.Interaction):
