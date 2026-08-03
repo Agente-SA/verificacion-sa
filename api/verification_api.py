@@ -282,44 +282,28 @@ async def _grant_verified_role(member: discord.Member) -> bool:
     if fresh_member.get_role(role.id) is not None:
         return False
 
-    reason = "Verificacion SA aprobada automaticamente"
     try:
-        await fresh_member.add_roles(role, reason=reason)
-    except discord.Forbidden as direct_error:
-        if direct_error.code != 50001:
-            raise RoleGrantError(str(direct_error), diagnostics) from direct_error
-
-        logger.warning(
-            (
-                "Discord rechazo el endpoint directo de rol para %s; "
-                "intentando actualizacion completa del miembro."
-            ),
-            fresh_member.id,
+        await fresh_member.add_roles(
+            role,
+            reason="Verificacion SA aprobada automaticamente",
         )
-        try:
-            await fresh_member.add_roles(
-                role,
-                reason=reason,
-                atomic=False,
-            )
-        except discord.HTTPException as fallback_error:
-            raise RoleGrantError(
-                (
-                    f"Endpoint directo: {direct_error}; "
-                    f"actualizacion del miembro: {fallback_error}"
-                ),
-                diagnostics,
-            ) from fallback_error
     except discord.HTTPException as exc:
         raise RoleGrantError(str(exc), diagnostics) from exc
     return True
 
 
 async def _remove_verified_role(member: discord.Member) -> None:
-    role = member.guild.get_role(VERIFIED_ROLE_ID)
-    if role is None or member.get_role(role.id) is None:
+    guild = member.guild
+    roles = await guild.fetch_roles()
+    role = discord.utils.get(roles, id=VERIFIED_ROLE_ID)
+    if role is None:
         return
-    await member.remove_roles(
+
+    try:
+        fresh_member = await guild.fetch_member(member.id)
+    except discord.NotFound:
+        return
+    await fresh_member.remove_roles(
         role,
         reason="Reversion por error al guardar la verificacion SA",
     )

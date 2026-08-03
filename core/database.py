@@ -197,13 +197,13 @@ SELECT
     fingerprint_hash,
     MIN(created_at),
     MAX(created_at),
-    MAX(created_at) + ($1 * INTERVAL '1 day')
+    MAX(created_at) + ($1::INTEGER * INTERVAL '1 day')
 FROM verification_attempts
 WHERE decision='approved'
   AND role_granted=TRUE
   AND ip_network_hash IS NOT NULL
   AND fingerprint_hash IS NOT NULL
-  AND created_at + ($1 * INTERVAL '1 day') > CURRENT_TIMESTAMP
+  AND created_at + ($1::INTEGER * INTERVAL '1 day') > CURRENT_TIMESTAMP
 GROUP BY guild_id, user_id, ip_hash, ip_network_hash, fingerprint_hash
 ON CONFLICT (
     guild_id,
@@ -623,8 +623,11 @@ async def finalize_verification_attempt(
                         expires_at
                     )
                     VALUES (
-                        $1, $2, $3, $4, $5, $6, $6,
-                        $6 + ($7 * INTERVAL '1 day')
+                        $1, $2, $3, $4, $5,
+                        $6::TIMESTAMPTZ,
+                        $6::TIMESTAMPTZ,
+                        $6::TIMESTAMPTZ
+                            + ($7::INTEGER * INTERVAL '1 day')
                     )
                     ON CONFLICT (
                         guild_id,
