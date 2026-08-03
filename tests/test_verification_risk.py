@@ -51,7 +51,7 @@ class VerificationRiskTests(unittest.TestCase):
 
         result = assess_verification_risk(attempt(), [candidate], now=NOW)
 
-        self.assertEqual(result.score, 45)
+        self.assertEqual(result.score, 15)
         self.assertNotIn(
             "Pais coincidente junto a la conexion de red",
             result.reasons,
@@ -69,7 +69,7 @@ class VerificationRiskTests(unittest.TestCase):
         result = assess_verification_risk(attempt(), [candidate], now=NOW)
 
         self.assertEqual(result.score, 35)
-        self.assertEqual(result.decision, "approved")
+        self.assertEqual(result.decision, "review")
         self.assertIn(
             "Pais coincidente junto a la conexion de red",
             result.reasons,
@@ -92,7 +92,7 @@ class VerificationRiskTests(unittest.TestCase):
             server_joined_at=NOW - timedelta(days=5),
         )
 
-        self.assertEqual(result.score, 70)
+        self.assertEqual(result.score, 40)
         self.assertEqual(result.decision, "review")
 
     def test_exact_ip_within_thirty_days_still_forces_review(self):
@@ -105,10 +105,10 @@ class VerificationRiskTests(unittest.TestCase):
 
         result = assess_verification_risk(attempt(), [candidate], now=NOW)
 
-        self.assertEqual(result.score, 65)
+        self.assertEqual(result.score, 50)
         self.assertEqual(result.decision, "review")
 
-    def test_archived_exact_ip_alone_does_not_force_review(self):
+    def test_archived_exact_ip_alone_requires_review(self):
         candidate = attempt(
             user_id=2,
             fingerprint_hash="different-fingerprint",
@@ -123,7 +123,7 @@ class VerificationRiskTests(unittest.TestCase):
         result = assess_verification_risk(attempt(), [candidate], now=NOW)
 
         self.assertEqual(result.score, 45)
-        self.assertEqual(result.decision, "approved")
+        self.assertEqual(result.decision, "review")
 
     def test_archived_exact_ip_and_fingerprint_still_require_review(self):
         candidate = attempt(
@@ -138,7 +138,7 @@ class VerificationRiskTests(unittest.TestCase):
 
         result = assess_verification_risk(attempt(), [candidate], now=NOW)
 
-        self.assertEqual(result.score, 90)
+        self.assertEqual(result.score, 60)
         self.assertEqual(result.decision, "review")
         self.assertEqual(result.possible_main_user_id, 2)
 
@@ -150,7 +150,7 @@ class VerificationRiskTests(unittest.TestCase):
             vpn_detected_by=("proxycheck.io",),
         )
 
-        self.assertEqual(result.score, 65)
+        self.assertEqual(result.score, 50)
         self.assertEqual(result.level, "medium")
         self.assertEqual(result.decision, "review")
         self.assertIsNone(result.possible_main_user_id)
@@ -165,7 +165,45 @@ class VerificationRiskTests(unittest.TestCase):
 
         self.assertEqual(result.score, 100)
         self.assertEqual(result.level, "high")
-        self.assertEqual(result.decision, "review")
+        self.assertEqual(result.decision, "rejected")
+
+    def test_one_unavailable_vpn_provider_uses_reduced_confidence(self):
+        result = assess_verification_risk(
+            attempt(),
+            [],
+            now=NOW,
+            vpn_unavailable_by=("ipapi.is",),
+        )
+
+        self.assertEqual(result.score, 5)
+        self.assertEqual(result.decision, "approved")
+
+    def test_combined_signals_at_sixty_five_are_rejected(self):
+        candidate = attempt(
+            user_id=2,
+            created_at=NOW - timedelta(hours=2),
+        )
+
+        result = assess_verification_risk(attempt(), [candidate], now=NOW)
+
+        self.assertEqual(result.score, 85)
+        self.assertEqual(result.decision, "rejected")
+
+    def test_versioned_hash_match_flags_are_honored(self):
+        candidate = attempt(
+            user_id=2,
+            ip_hash="old-secret-hash",
+            ip_network_hash="old-network-hash",
+            fingerprint_hash="old-fingerprint-hash",
+            exact_ip_match=True,
+            network_match=True,
+            fingerprint_match=True,
+        )
+
+        result = assess_verification_risk(attempt(), [candidate], now=NOW)
+
+        self.assertEqual(result.score, 70)
+        self.assertEqual(result.decision, "rejected")
 
 
 if __name__ == "__main__":

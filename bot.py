@@ -31,7 +31,14 @@ class VerificationBot(commands.Bot):
         validate_configuration()
         await init_db()
 
-        verificacion.setup(self)
+        verification_manager = verificacion.setup(self)
+        restored_reviews = (
+            await verification_manager.restore_pending_manual_reviews()
+        )
+        if restored_reviews:
+            print(
+                f"Revisiones manuales restauradas: {restored_reviews} pendiente(s)."
+            )
         self.verification_api = VerificationAPIServer(self)
         await self.verification_api.start()
         self.cleanup_verification_data_task.start()

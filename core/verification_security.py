@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 from core.config import (
     FRONTEND_URL,
     IP_HASH_SECRET,
+    IP_HASH_SECRET_PREVIOUS,
     TOKEN_EXPIRATION_MINUTES,
     TOKEN_SECRET,
 )
@@ -65,21 +66,38 @@ def _token_secret_bytes() -> bytes:
     return TOKEN_SECRET.encode("utf-8")
 
 
-def _privacy_secret_bytes() -> bytes:
-    if len(IP_HASH_SECRET) < PRIVACY_SECRET_MIN_LENGTH:
+def _privacy_secret_bytes(secret: str = IP_HASH_SECRET) -> bytes:
+    if len(secret) < PRIVACY_SECRET_MIN_LENGTH:
         raise VerificationConfigurationError(
             "IP_HASH_SECRET debe contener al menos 32 caracteres."
         )
-    return IP_HASH_SECRET.encode("utf-8")
+    return secret.encode("utf-8")
 
 
-def _privacy_digest(namespace: str, value: str) -> str:
+def _privacy_digest(
+    namespace: str,
+    value: str,
+    *,
+    secret: str = IP_HASH_SECRET,
+) -> str:
     message = f"{namespace}\0{value}".encode("utf-8")
     return hmac.new(
-        _privacy_secret_bytes(),
+        _privacy_secret_bytes(secret),
         message,
         hashlib.sha256,
     ).hexdigest()
+
+
+def _privacy_digests(namespace: str, value: str) -> tuple[str, ...]:
+    secrets = [IP_HASH_SECRET]
+    if IP_HASH_SECRET_PREVIOUS:
+        secrets.append(IP_HASH_SECRET_PREVIOUS)
+    return tuple(
+        dict.fromkeys(
+            _privacy_digest(namespace, value, secret=secret)
+            for secret in secrets
+        )
+    )
 
 
 def _urlsafe_encode(value: bytes) -> str:
@@ -126,6 +144,14 @@ def hash_ip_address(ip_address: str) -> str:
     return _privacy_digest("verification-ip:v1", canonical_ip)
 
 
+def hash_ip_address_candidates(ip_address: str) -> tuple[str, ...]:
+    try:
+        canonical_ip = ipaddress.ip_address(ip_address).compressed
+    except ValueError as exc:
+        raise ValueError("Direccion IP invalida.") from exc
+    return _privacy_digests("verification-ip:v1", canonical_ip)
+
+
 def hash_ip_network(ip_address: str) -> str:
     try:
         parsed_ip = ipaddress.ip_address(ip_address)
@@ -141,6 +167,24 @@ def hash_ip_network(ip_address: str) -> str:
     return _privacy_digest("verification-ip-network:v1", canonical_network)
 
 
+def hash_ip_network_candidates(ip_address: str) -> tuple[str, ...]:
+    try:
+        parsed_ip = ipaddress.ip_address(ip_address)
+    except ValueError as exc:
+        raise ValueError("Direccion IP invalida.") from exc
+
+    prefix_length = 24 if parsed_ip.version == 4 else 64
+    network = ipaddress.ip_network(
+        f"{parsed_ip.compressed}/{prefix_length}",
+        strict=False,
+    )
+    canonical_network = f"ipv{parsed_ip.version}:{network.with_prefixlen}"
+    return _privacy_digests(
+        "verification-ip-network:v1",
+        canonical_network,
+    )
+
+
 def hash_limited_fingerprint(signals: Mapping[str, object]) -> str:
     canonical_signals = json.dumps(
         dict(signals),
@@ -149,6 +193,21 @@ def hash_limited_fingerprint(signals: Mapping[str, object]) -> str:
         sort_keys=True,
     )
     return _privacy_digest("verification-fingerprint:v1", canonical_signals)
+
+
+def hash_limited_fingerprint_candidates(
+    signals: Mapping[str, object],
+) -> tuple[str, ...]:
+    canonical_signals = json.dumps(
+        dict(signals),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return _privacy_digests(
+        "verification-fingerprint:v1",
+        canonical_signals,
+    )
 
 
 def build_verification_url(token: str) -> str:

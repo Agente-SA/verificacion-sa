@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+from datetime import datetime, timezone
 
 import discord
 
@@ -8,10 +9,12 @@ from core import database
 from core.config import (
     DB_NO_DISPONIBLE,
     GUILD_ID,
+    STAFF_ROLE_IDS,
     TOKEN_EXPIRATION_MINUTES,
     VERIFICATION_TICKET_CHANNEL_ID,
     VERIFIED_ROLE_ID,
     get_configuration_errors,
+    is_staff,
     require_staff,
 )
 from core.verification_security import create_signed_verification_token
@@ -65,6 +68,52 @@ class VerificationPanelView(discord.ui.View):
         _button: discord.ui.Button,
     ):
         await self.manager.issue_personal_link(interaction)
+
+
+class ManualReviewDecisionButton(discord.ui.Button):
+    def __init__(self, attempt_id: int, *, accepted: bool):
+        self.attempt_id = attempt_id
+        self.accepted = accepted
+        super().__init__(
+            label="Aceptar" if accepted else "Rechazar",
+            style=(
+                discord.ButtonStyle.success
+                if accepted
+                else discord.ButtonStyle.danger
+            ),
+            custom_id=(
+                f"verification_sa:review:{attempt_id}:"
+                f"{'accept' if accepted else 'reject'}:v1"
+            ),
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, ManualReviewView):
+            return
+        await view.manager.resolve_manual_review(
+            interaction,
+            self.attempt_id,
+            accepted=self.accepted,
+        )
+
+
+class ManualReviewView(discord.ui.View):
+    def __init__(self, manager: "VerificationManager", attempt_id: int):
+        super().__init__(timeout=None)
+        self.manager = manager
+        self.attempt_id = attempt_id
+        self.add_item(ManualReviewDecisionButton(attempt_id, accepted=True))
+        self.add_item(ManualReviewDecisionButton(attempt_id, accepted=False))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if is_staff(interaction):
+            return True
+        await interaction.response.send_message(
+            "No tienes permisos para resolver esta revisión.",
+            ephemeral=True,
+        )
+        return False
 
 
 class VerifiedUsersPaginator(discord.ui.View):
@@ -259,6 +308,7 @@ class VerificationManager:
         self._issue_locks = {}
         self._last_issued_at = {}
         self._pending_result_interactions = {}
+        self._manual_review_locks = {}
 
     def _purge_expired_result_interactions(self, now: float) -> None:
         expired_tokens = [
@@ -289,7 +339,7 @@ class VerificationManager:
         self,
         token_id,
         user_id: int,
-        approved: bool,
+        outcome: str,
     ) -> bool:
         now = asyncio.get_running_loop().time()
         self._purge_expired_result_interactions(now)
@@ -298,8 +348,19 @@ class VerificationManager:
             return False
 
         self._pending_result_interactions.pop(token_id, None)
-        if approved:
-            content = "Tu cuenta ha sido Verificada con Éxito ✔️"
+        if outcome == "approved":
+            content = "Tu cuenta ha sido Verificada con Éxito ✅"
+        elif outcome == "review":
+            content = (
+                "🗒️ Su solicitud de Verificación se envió a revisión. "
+                "Cuando sea aceptada recibirá el Rol "
+                f"<@&{VERIFIED_ROLE_ID}>. Agradecemos su paciencia."
+            )
+        elif outcome == "retry":
+            content = (
+                "No fue posible completar las comprobaciones en este momento. "
+                "Genera un enlace nuevo e inténtalo nuevamente más tarde."
+            )
         else:
             content = (
                 "❌ Tu cuenta no ha podido ser verificada. Si crees que se trata "
@@ -309,6 +370,212 @@ class VerificationManager:
 
         await pending[1].followup.send(content, ephemeral=True)
         return True
+
+    def manual_review_view(self, attempt_id: int) -> ManualReviewView:
+        return ManualReviewView(self, attempt_id)
+
+    async def restore_pending_manual_reviews(self) -> int:
+        recovered = await database.recover_incomplete_manual_reviews()
+        if recovered:
+            logger.warning(
+                "Se recuperaron %s revisiones interrumpidas.",
+                recovered,
+            )
+        rows = await database.get_pending_manual_reviews()
+        for row in rows:
+            self.bot.add_view(
+                self.manual_review_view(int(row["id"])),
+                message_id=int(row["staff_message_id"]),
+            )
+        return len(rows)
+
+    async def _manual_review_member(self, row):
+        guild = self.bot.get_guild(int(row["guild_id"]))
+        if guild is None:
+            return None
+        member = guild.get_member(int(row["user_id"]))
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(int(row["user_id"]))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+
+    async def _release_manual_review(
+        self,
+        attempt_id: int,
+        reviewer_id: int,
+    ) -> None:
+        try:
+            await database.release_manual_review_claim(
+                attempt_id,
+                reviewer_id,
+            )
+        except Exception:
+            logger.exception(
+                "No se pudo liberar la revisión manual %s.",
+                attempt_id,
+            )
+
+    async def _notify_reviewed_user(
+        self,
+        member: discord.Member,
+        *,
+        accepted: bool,
+    ) -> None:
+        if accepted:
+            content = (
+                "Tu solicitud de Verificación fue aceptada y ya recibiste "
+                f"el rol <@&{VERIFIED_ROLE_ID}>."
+            )
+        else:
+            content = (
+                "Tu solicitud de Verificación fue rechazada. Si crees que se "
+                "trata de un error, abre un ticket en "
+                f"<#{VERIFICATION_TICKET_CHANNEL_ID}> y selecciona la Opción 1."
+            )
+        try:
+            await member.send(content)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.info(
+                "No se pudo enviar el resultado manual por DM al usuario %s.",
+                member.id,
+            )
+
+    async def resolve_manual_review(
+        self,
+        interaction: discord.Interaction,
+        attempt_id: int,
+        *,
+        accepted: bool,
+    ) -> None:
+        lock = self._manual_review_locks.setdefault(attempt_id, asyncio.Lock())
+        async with lock:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                claimed = await database.claim_manual_review(
+                    attempt_id,
+                    interaction.user.id,
+                )
+            except Exception:
+                logger.exception("No se pudo reclamar la revisión %s.", attempt_id)
+                await interaction.followup.send(
+                    "No fue posible abrir esta revisión. Inténtalo nuevamente.",
+                    ephemeral=True,
+                )
+                return
+            if claimed is None:
+                await interaction.followup.send(
+                    "Esta revisión ya fue procesada por otro miembro del staff.",
+                    ephemeral=True,
+                )
+                return
+
+            member = await self._manual_review_member(claimed)
+            if member is None:
+                await self._release_manual_review(
+                    attempt_id,
+                    interaction.user.id,
+                )
+                await interaction.followup.send(
+                    "El usuario ya no está disponible dentro del servidor.",
+                    ephemeral=True,
+                )
+                return
+
+            role_added = False
+            if accepted:
+                from api.verification_api import (
+                    RoleGrantError,
+                    _grant_verified_role,
+                    _remove_verified_role,
+                )
+
+                try:
+                    role_added = await _grant_verified_role(
+                        member,
+                        reason=(
+                            "Verificacion SA aprobada manualmente por staff "
+                            f"{interaction.user.id}"
+                        ),
+                    )
+                except (RoleGrantError, discord.HTTPException) as exc:
+                    await self._release_manual_review(
+                        attempt_id,
+                        interaction.user.id,
+                    )
+                    logger.exception(
+                        "No se pudo otorgar el rol en la revisión %s.",
+                        attempt_id,
+                    )
+                    await interaction.followup.send(
+                        f"No fue posible otorgar el rol: {str(exc)[:300]}",
+                        ephemeral=True,
+                    )
+                    return
+
+            try:
+                completed = await database.complete_manual_review(
+                    attempt_id,
+                    interaction.user.id,
+                    accepted=accepted,
+                )
+                if completed is None:
+                    raise RuntimeError("La revisión dejó de estar disponible.")
+            except Exception:
+                if accepted and role_added:
+                    try:
+                        await _remove_verified_role(member)
+                    except discord.HTTPException:
+                        logger.exception(
+                            "No se pudo revertir el rol de la revisión %s.",
+                            attempt_id,
+                        )
+                await self._release_manual_review(
+                    attempt_id,
+                    interaction.user.id,
+                )
+                logger.exception("No se pudo finalizar la revisión %s.", attempt_id)
+                await interaction.followup.send(
+                    "No fue posible guardar la decisión. Inténtalo nuevamente.",
+                    ephemeral=True,
+                )
+                return
+
+            result = "ACEPTADA" if accepted else "RECHAZADA"
+            embed = (
+                discord.Embed.from_dict(interaction.message.embeds[0].to_dict())
+                if interaction.message and interaction.message.embeds
+                else discord.Embed(title="Revisión de Verificación SA")
+            )
+            embed.color = (
+                discord.Color.green() if accepted else discord.Color.red()
+            )
+            embed.add_field(
+                name="Resolución",
+                value=(
+                    f"**{result}** por {interaction.user.mention} "
+                    f"(`{interaction.user.id}`)"
+                ),
+                inline=False,
+            )
+            disabled_view = self.manual_review_view(attempt_id)
+            for item in disabled_view.children:
+                item.disabled = True
+            try:
+                await interaction.message.edit(embed=embed, view=disabled_view)
+            except discord.HTTPException:
+                logger.exception(
+                    "No se pudo actualizar el embed de revisión %s.",
+                    attempt_id,
+                )
+
+            await self._notify_reviewed_user(member, accepted=accepted)
+            await interaction.followup.send(
+                f"Revisión **{result.lower()}** correctamente.",
+                ephemeral=True,
+            )
+            self._manual_review_locks.pop(attempt_id, None)
 
     def clear_user_runtime_state(self, user_id: int) -> None:
         self._last_issued_at.pop(user_id, None)
@@ -415,7 +682,6 @@ class VerificationManager:
                 "verify.png"
             )
         )
-        embed.set_footer(text="Desarrollado por Super Sus SA Oficial")
         return embed
 
     async def issue_personal_link(self, interaction: discord.Interaction):
@@ -675,3 +941,73 @@ def setup(bot):
             ),
             ephemeral=True,
         )
+
+    @bot.tree.command(
+        name="metricas",
+        description="(Staff) Muestra las métricas del mes de verificación.",
+    )
+    @require_staff()
+    async def metricas(interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Este comando solo está disponible dentro del servidor.",
+                ephemeral=True,
+            )
+            return
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if month_start.month == 12:
+            month_end = month_start.replace(
+                year=month_start.year + 1,
+                month=1,
+            )
+        else:
+            month_end = month_start.replace(month=month_start.month + 1)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            metrics = await database.get_monthly_verification_metrics(
+                interaction.guild.id,
+                month_start,
+                month_end,
+            )
+        except Exception:
+            logger.exception("No se pudieron consultar las métricas mensuales.")
+            await interaction.followup.send(
+                "No fue posible consultar las métricas en este momento.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="Métricas de Verificación SA",
+            description=f"Periodo UTC: **{month_start:%m/%Y}**",
+            color=discord.Color.blue(),
+        )
+        labels = (
+            ("Solicitudes registradas", "total"),
+            ("Aprobadas", "approved"),
+            ("Enviadas a revisión", "reviewed"),
+            ("Rechazadas", "rejected"),
+            ("VPN / Proxy detectadas", "vpn_detected"),
+            ("Apelaciones aceptadas", "appeals_accepted"),
+            ("Falsos positivos", "false_positives"),
+        )
+        for label, key in labels:
+            embed.add_field(
+                name=label,
+                value=f"**{int(metrics[key] or 0)}**",
+                inline=True,
+            )
+        embed.set_footer(
+            text="Las métricas detalladas siguen la retención de intentos configurada."
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    return verification

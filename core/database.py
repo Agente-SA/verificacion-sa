@@ -1,4 +1,6 @@
+import hashlib
 import json
+from contextlib import asynccontextmanager
 
 import asyncpg
 
@@ -49,7 +51,14 @@ CREATE TABLE IF NOT EXISTS verification_attempts (
     device_type TEXT,
     vpn_detected BOOLEAN,
     proxy_detected BOOLEAN,
+    tor_detected BOOLEAN,
     hosting_detected BOOLEAN,
+    datacenter_detected BOOLEAN,
+    vpn_check_status TEXT NOT NULL DEFAULT 'not_evaluated'
+        CHECK (vpn_check_status IN ('not_evaluated', 'partial', 'completed')),
+    vpn_provider_results JSONB NOT NULL DEFAULT '{}'::jsonb,
+    vpn_checked_at TIMESTAMP WITH TIME ZONE,
+    hash_key_version INTEGER NOT NULL DEFAULT 1,
     risk_score SMALLINT NOT NULL DEFAULT 0
         CHECK (risk_score BETWEEN 0 AND 100),
     risk_level TEXT NOT NULL DEFAULT 'pending'
@@ -58,6 +67,19 @@ CREATE TABLE IF NOT EXISTS verification_attempts (
         CHECK (decision IN ('pending', 'approved', 'review', 'rejected', 'error')),
     role_granted BOOLEAN NOT NULL DEFAULT FALSE,
     possible_main_user_id BIGINT,
+    manual_review_required BOOLEAN NOT NULL DEFAULT FALSE,
+    manual_review_status TEXT NOT NULL DEFAULT 'not_required'
+        CHECK (
+            manual_review_status IN (
+                'not_required', 'pending', 'processing', 'accepted', 'rejected'
+            )
+        ),
+    reviewed_by BIGINT,
+    reviewed_at TIMESTAMP WITH TIME ZONE,
+    staff_channel_id BIGINT,
+    staff_message_id BIGINT,
+    appeal_accepted BOOLEAN NOT NULL DEFAULT FALSE,
+    false_positive BOOLEAN NOT NULL DEFAULT FALSE,
     risk_reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
     consent_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     signals JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -118,6 +140,28 @@ CREATE INDEX IF NOT EXISTS verification_antifraud_fingerprint_idx
     (guild_id, fingerprint_hash, expires_at DESC);
 CREATE INDEX IF NOT EXISTS verification_antifraud_expiration_idx
     ON verification_antifraud_signals (expires_at);
+"""
+
+
+MIGRATION_SQL = """
+ALTER TABLE verification_attempts
+    ADD COLUMN IF NOT EXISTS tor_detected BOOLEAN,
+    ADD COLUMN IF NOT EXISTS datacenter_detected BOOLEAN,
+    ADD COLUMN IF NOT EXISTS vpn_check_status TEXT NOT NULL DEFAULT 'not_evaluated',
+    ADD COLUMN IF NOT EXISTS vpn_provider_results JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS vpn_checked_at TIMESTAMP WITH TIME ZONE,
+    ADD COLUMN IF NOT EXISTS hash_key_version INTEGER NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS manual_review_required BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS manual_review_status TEXT NOT NULL DEFAULT 'not_required',
+    ADD COLUMN IF NOT EXISTS reviewed_by BIGINT,
+    ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP WITH TIME ZONE,
+    ADD COLUMN IF NOT EXISTS staff_channel_id BIGINT,
+    ADD COLUMN IF NOT EXISTS staff_message_id BIGINT,
+    ADD COLUMN IF NOT EXISTS appeal_accepted BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS false_positive BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS verification_attempts_manual_review_idx
+    ON verification_attempts (manual_review_status, created_at DESC)
+    WHERE manual_review_required=TRUE;
 """
 
 
@@ -234,6 +278,41 @@ def _pool() -> asyncpg.Pool:
     return bot_pool
 
 
+@asynccontextmanager
+async def _connection(conn: asyncpg.Connection | None = None):
+    if conn is not None:
+        yield conn
+        return
+    async with _pool().acquire() as acquired:
+        yield acquired
+
+
+def _advisory_lock_key(value: str) -> int:
+    digest = hashlib.blake2b(
+        value.encode("ascii"),
+        digest_size=8,
+        person=b"verify-lock-v1",
+    ).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+@asynccontextmanager
+async def verification_signal_transaction(
+    ip_hash: str,
+    ip_network_hash: str | None,
+):
+    values = {value for value in (ip_hash, ip_network_hash) if value}
+    lock_keys = sorted(_advisory_lock_key(value) for value in values)
+    async with _pool().acquire() as conn:
+        async with conn.transaction():
+            for lock_key in lock_keys:
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1::BIGINT)",
+                    lock_key,
+                )
+            yield conn
+
+
 async def init_db() -> None:
     global bot_pool
     if bot_pool is not None:
@@ -249,6 +328,7 @@ async def init_db() -> None:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(SCHEMA_SQL)
+                await conn.execute(MIGRATION_SQL)
                 await conn.execute(BACKFILL_VERIFIED_USERS_SQL)
                 await conn.execute(
                     BACKFILL_ANTIFRAUD_SQL,
@@ -331,9 +411,18 @@ async def revoke_verification_token(token_id, token_digest):
         )
 
 
-async def get_verification_submission_counts(guild_id, user_id, ip_hash, since):
-    async with _pool().acquire() as conn:
-        row = await conn.fetchrow(
+async def get_verification_submission_counts(
+    guild_id,
+    user_id,
+    ip_hashes,
+    since,
+    *,
+    conn=None,
+):
+    if isinstance(ip_hashes, str):
+        ip_hashes = (ip_hashes,)
+    async with _connection(conn) as active_conn:
+        row = await active_conn.fetchrow(
             """
             SELECT
                 (
@@ -344,12 +433,14 @@ async def get_verification_submission_counts(guild_id, user_id, ip_hash, since):
                 (
                     SELECT COUNT(*)
                     FROM verification_attempts
-                    WHERE guild_id=$1 AND ip_hash=$3 AND created_at >= $4
+                    WHERE guild_id=$1
+                      AND ip_hash::TEXT=ANY($3::TEXT[])
+                      AND created_at >= $4
                 ) AS ip_count
             """,
             guild_id,
             user_id,
-            ip_hash,
+            list(ip_hashes),
             since,
         )
         return int(row["user_count"]), int(row["ip_count"])
@@ -374,6 +465,13 @@ async def record_pending_verification_attempt(
     device_type,
     signals,
     retention_until,
+    hash_key_version=1,
+    vpn_check_status="not_evaluated",
+    vpn_provider_results=None,
+    vpn_checked_at=None,
+    vpn_signal_types=(),
+    vpn_detected=False,
+    conn=None,
 ):
     signals_json = json.dumps(
         signals,
@@ -381,9 +479,16 @@ async def record_pending_verification_attempt(
         separators=(",", ":"),
         sort_keys=True,
     )
-    async with _pool().acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(
+    provider_results_json = json.dumps(
+        vpn_provider_results or {},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    signal_types = set(vpn_signal_types)
+    async with _connection(conn) as active_conn:
+        async with active_conn.transaction():
+            await active_conn.execute(
                 """
                 UPDATE verification_tokens
                 SET status='expired'
@@ -395,7 +500,7 @@ async def record_pending_verification_attempt(
                 token_id,
                 token_digest,
             )
-            consumed_token = await conn.fetchrow(
+            consumed_token = await active_conn.fetchrow(
                 """
                 UPDATE verification_tokens
                 SET status='used', used_at=CURRENT_TIMESTAMP
@@ -415,17 +520,21 @@ async def record_pending_verification_attempt(
             if consumed_token is None:
                 return None
 
-            return await conn.fetchrow(
+            return await active_conn.fetchrow(
                 """
                 INSERT INTO verification_attempts (
                     token_id, guild_id, user_id, discord_tag, ip_hash,
                     ip_network_hash, fingerprint_hash, country_code, region,
                     timezone, language, browser_family, os_family, device_type,
-                    signals, retention_until
+                    signals, retention_until, hash_key_version,
+                    vpn_detected, proxy_detected, tor_detected,
+                    hosting_detected, datacenter_detected,
+                    vpn_check_status, vpn_provider_results, vpn_checked_at
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15::jsonb, $16
+                    $11, $12, $13, $14, $15::jsonb, $16, $17,
+                    $18, $19, $20, $21, $22, $23, $24::jsonb, $25
                 )
                 RETURNING *
                 """,
@@ -445,19 +554,30 @@ async def record_pending_verification_attempt(
                 device_type,
                 signals_json,
                 retention_until,
+                hash_key_version,
+                vpn_detected or "vpn" in signal_types,
+                "proxy" in signal_types,
+                "tor" in signal_types,
+                "hosting" in signal_types,
+                "datacenter" in signal_types,
+                vpn_check_status,
+                provider_results_json,
+                vpn_checked_at,
             )
 
 
 async def get_verification_match_candidates(
     guild_id,
     user_id,
-    ip_hash,
-    ip_network_hash,
-    fingerprint_hash,
+    ip_hashes,
+    ip_network_hashes,
+    fingerprint_hashes,
     limit=100,
+    *,
+    conn=None,
 ):
-    async with _pool().acquire() as conn:
-        return await conn.fetch(
+    async with _connection(conn) as active_conn:
+        return await active_conn.fetch(
             """
             WITH candidates AS (
                 SELECT
@@ -475,16 +595,20 @@ async def get_verification_match_candidates(
                     device_type,
                     decision,
                     role_granted,
-                    created_at
+                    created_at,
+                    ip_hash::TEXT=ANY($3::TEXT[]) AS exact_ip_match,
+                    ip_network_hash::TEXT=ANY($4::TEXT[]) AS network_match,
+                    fingerprint_hash::TEXT=ANY($5::TEXT[]) AS fingerprint_match
                 FROM verification_attempts
                 WHERE guild_id=$1
                   AND user_id<>$2
                   AND retention_until > CURRENT_TIMESTAMP
-                  AND decision IN ('pending', 'approved', 'review')
+                  AND decision='approved'
+                  AND role_granted=TRUE
                   AND (
-                        ip_hash=$3
-                        OR ip_network_hash=$4
-                        OR fingerprint_hash=$5
+                        ip_hash::TEXT=ANY($3::TEXT[])
+                        OR ip_network_hash::TEXT=ANY($4::TEXT[])
+                        OR fingerprint_hash::TEXT=ANY($5::TEXT[])
                   )
 
                 UNION ALL
@@ -504,7 +628,10 @@ async def get_verification_match_candidates(
                     NULL::TEXT AS device_type,
                     'approved'::TEXT AS decision,
                     TRUE AS role_granted,
-                    antifraud.last_seen AS created_at
+                    antifraud.last_seen AS created_at,
+                    antifraud.ip_hash::TEXT=ANY($3::TEXT[]) AS exact_ip_match,
+                    antifraud.ip_network_hash::TEXT=ANY($4::TEXT[]) AS network_match,
+                    antifraud.fingerprint_hash::TEXT=ANY($5::TEXT[]) AS fingerprint_match
                 FROM verification_antifraud_signals AS antifraud
                 LEFT JOIN verified_users AS users
                   ON users.guild_id=antifraud.guild_id
@@ -513,23 +640,97 @@ async def get_verification_match_candidates(
                   AND antifraud.user_id<>$2
                   AND antifraud.expires_at > CURRENT_TIMESTAMP
                   AND (
-                        antifraud.ip_hash=$3
-                        OR antifraud.ip_network_hash=$4
-                        OR antifraud.fingerprint_hash=$5
+                        antifraud.ip_hash::TEXT=ANY($3::TEXT[])
+                        OR antifraud.ip_network_hash::TEXT=ANY($4::TEXT[])
+                        OR antifraud.fingerprint_hash::TEXT=ANY($5::TEXT[])
                   )
             )
             SELECT *
             FROM candidates
-            ORDER BY created_at ASC
+            ORDER BY created_at DESC
             LIMIT $6
             """,
             guild_id,
             user_id,
-            ip_hash,
-            ip_network_hash,
-            fingerprint_hash,
+            list(ip_hashes),
+            list(ip_network_hashes),
+            list(fingerprint_hashes),
             limit,
         )
+
+
+async def _persist_approved_verification(conn, updated) -> None:
+    await conn.execute(
+        """
+        INSERT INTO verified_users (
+            guild_id, user_id, first_verified_at, last_verified_at,
+            last_country_code, status
+        )
+        VALUES ($1, $2, $3, $3, $4, 'verified')
+        ON CONFLICT (guild_id, user_id) DO UPDATE
+        SET
+            first_verified_at=LEAST(
+                verified_users.first_verified_at,
+                EXCLUDED.first_verified_at
+            ),
+            last_verified_at=GREATEST(
+                verified_users.last_verified_at,
+                EXCLUDED.last_verified_at
+            ),
+            last_country_code=COALESCE(
+                EXCLUDED.last_country_code,
+                verified_users.last_country_code
+            ),
+            status='verified',
+            updated_at=CURRENT_TIMESTAMP
+        """,
+        updated["guild_id"],
+        updated["user_id"],
+        updated["created_at"],
+        updated["country_code"],
+    )
+    if (
+        updated["ip_network_hash"] is None
+        or updated["fingerprint_hash"] is None
+    ):
+        return
+    await conn.execute(
+        """
+        INSERT INTO verification_antifraud_signals (
+            guild_id, user_id, ip_hash, ip_network_hash, fingerprint_hash,
+            first_seen, last_seen, expires_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5,
+            $6::TIMESTAMPTZ,
+            $6::TIMESTAMPTZ,
+            $6::TIMESTAMPTZ + ($7::INTEGER * INTERVAL '1 day')
+        )
+        ON CONFLICT (
+            guild_id, user_id, ip_hash, ip_network_hash, fingerprint_hash
+        ) DO UPDATE
+        SET
+            first_seen=LEAST(
+                verification_antifraud_signals.first_seen,
+                EXCLUDED.first_seen
+            ),
+            last_seen=GREATEST(
+                verification_antifraud_signals.last_seen,
+                EXCLUDED.last_seen
+            ),
+            expires_at=GREATEST(
+                verification_antifraud_signals.expires_at,
+                EXCLUDED.expires_at
+            )
+        """,
+        updated["guild_id"],
+        updated["user_id"],
+        updated["ip_hash"],
+        updated["ip_network_hash"],
+        updated["fingerprint_hash"],
+        updated["created_at"],
+        ANTIFRAUD_RETENTION_DAYS,
+    )
 
 
 async def finalize_verification_attempt(
@@ -541,15 +742,18 @@ async def finalize_verification_attempt(
     role_granted,
     possible_main_user_id,
     risk_reasons,
+    manual_review_required=False,
+    manual_review_status="not_required",
+    conn=None,
 ):
     reasons_json = json.dumps(
         risk_reasons,
         ensure_ascii=True,
         separators=(",", ":"),
     )
-    async with _pool().acquire() as conn:
-        async with conn.transaction():
-            updated = await conn.fetchrow(
+    async with _connection(conn) as active_conn:
+        async with active_conn.transaction():
+            updated = await active_conn.fetchrow(
                 """
                 UPDATE verification_attempts
                 SET risk_score=$2,
@@ -558,6 +762,8 @@ async def finalize_verification_attempt(
                     role_granted=$5,
                     possible_main_user_id=$6,
                     risk_reasons=$7::jsonb,
+                    manual_review_required=$8,
+                    manual_review_status=$9,
                     updated_at=CURRENT_TIMESTAMP
                 WHERE id=$1
                 RETURNING *
@@ -569,96 +775,160 @@ async def finalize_verification_attempt(
                 role_granted,
                 possible_main_user_id,
                 reasons_json,
+                manual_review_required,
+                manual_review_status,
             )
             if updated is None or decision != "approved" or not role_granted:
                 return updated
-
-            await conn.execute(
-                """
-                INSERT INTO verified_users (
-                    guild_id,
-                    user_id,
-                    first_verified_at,
-                    last_verified_at,
-                    last_country_code,
-                    status
-                )
-                VALUES ($1, $2, $3, $3, $4, 'verified')
-                ON CONFLICT (guild_id, user_id) DO UPDATE
-                SET
-                    first_verified_at=LEAST(
-                        verified_users.first_verified_at,
-                        EXCLUDED.first_verified_at
-                    ),
-                    last_verified_at=GREATEST(
-                        verified_users.last_verified_at,
-                        EXCLUDED.last_verified_at
-                    ),
-                    last_country_code=COALESCE(
-                        EXCLUDED.last_country_code,
-                        verified_users.last_country_code
-                    ),
-                    status='verified',
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                updated["guild_id"],
-                updated["user_id"],
-                updated["created_at"],
-                updated["country_code"],
-            )
-            if (
-                updated["ip_network_hash"] is not None
-                and updated["fingerprint_hash"] is not None
-            ):
-                await conn.execute(
-                    """
-                    INSERT INTO verification_antifraud_signals (
-                        guild_id,
-                        user_id,
-                        ip_hash,
-                        ip_network_hash,
-                        fingerprint_hash,
-                        first_seen,
-                        last_seen,
-                        expires_at
-                    )
-                    VALUES (
-                        $1, $2, $3, $4, $5,
-                        $6::TIMESTAMPTZ,
-                        $6::TIMESTAMPTZ,
-                        $6::TIMESTAMPTZ
-                            + ($7::INTEGER * INTERVAL '1 day')
-                    )
-                    ON CONFLICT (
-                        guild_id,
-                        user_id,
-                        ip_hash,
-                        ip_network_hash,
-                        fingerprint_hash
-                    ) DO UPDATE
-                    SET
-                        first_seen=LEAST(
-                            verification_antifraud_signals.first_seen,
-                            EXCLUDED.first_seen
-                        ),
-                        last_seen=GREATEST(
-                            verification_antifraud_signals.last_seen,
-                            EXCLUDED.last_seen
-                        ),
-                        expires_at=GREATEST(
-                            verification_antifraud_signals.expires_at,
-                            EXCLUDED.expires_at
-                        )
-                    """,
-                    updated["guild_id"],
-                    updated["user_id"],
-                    updated["ip_hash"],
-                    updated["ip_network_hash"],
-                    updated["fingerprint_hash"],
-                    updated["created_at"],
-                    ANTIFRAUD_RETENTION_DAYS,
-                )
+            await _persist_approved_verification(active_conn, updated)
             return updated
+
+
+async def save_manual_review_message(
+    attempt_id,
+    channel_id,
+    message_id,
+):
+    async with _pool().acquire() as conn:
+        return await conn.fetchrow(
+            """
+            UPDATE verification_attempts
+            SET staff_channel_id=$2,
+                staff_message_id=$3,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1
+              AND manual_review_status='pending'
+            RETURNING *
+            """,
+            attempt_id,
+            channel_id,
+            message_id,
+        )
+
+
+async def get_pending_manual_reviews():
+    async with _pool().acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT *
+            FROM verification_attempts
+            WHERE manual_review_required=TRUE
+              AND manual_review_status='pending'
+              AND staff_channel_id IS NOT NULL
+              AND staff_message_id IS NOT NULL
+            ORDER BY created_at ASC
+            """
+        )
+
+
+async def recover_incomplete_manual_reviews():
+    async with _pool().acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE verification_attempts
+            SET manual_review_status='pending',
+                reviewed_by=NULL,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE manual_review_status='processing'
+            """
+        )
+    return int(result.rsplit(" ", 1)[-1])
+
+
+async def claim_manual_review(attempt_id, reviewer_id):
+    async with _pool().acquire() as conn:
+        return await conn.fetchrow(
+            """
+            UPDATE verification_attempts
+            SET manual_review_status='processing',
+                reviewed_by=$2,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1 AND manual_review_status='pending'
+            RETURNING *
+            """,
+            attempt_id,
+            reviewer_id,
+        )
+
+
+async def release_manual_review_claim(attempt_id, reviewer_id):
+    async with _pool().acquire() as conn:
+        return await conn.fetchrow(
+            """
+            UPDATE verification_attempts
+            SET manual_review_status='pending',
+                reviewed_by=NULL,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1
+              AND manual_review_status='processing'
+              AND reviewed_by=$2
+            RETURNING *
+            """,
+            attempt_id,
+            reviewer_id,
+        )
+
+
+async def complete_manual_review(
+    attempt_id,
+    reviewer_id,
+    *,
+    accepted,
+):
+    async with _pool().acquire() as conn:
+        async with conn.transaction():
+            status = "accepted" if accepted else "rejected"
+            decision = "approved" if accepted else "rejected"
+            updated = await conn.fetchrow(
+                """
+                UPDATE verification_attempts
+                SET manual_review_status=$3,
+                    decision=$4,
+                    role_granted=$5,
+                    reviewed_at=CURRENT_TIMESTAMP,
+                    false_positive=$5,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=$1
+                  AND manual_review_status='processing'
+                  AND reviewed_by=$2
+                RETURNING *
+                """,
+                attempt_id,
+                reviewer_id,
+                status,
+                decision,
+                accepted,
+            )
+            if updated is not None and accepted:
+                await _persist_approved_verification(conn, updated)
+            return updated
+
+
+async def get_monthly_verification_metrics(guild_id, month_start, month_end):
+    async with _pool().acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE decision='approved') AS approved,
+                COUNT(*) FILTER (WHERE manual_review_required=TRUE) AS reviewed,
+                COUNT(*) FILTER (WHERE decision='rejected') AS rejected,
+                COUNT(*) FILTER (
+                    WHERE vpn_detected IS TRUE
+                       OR proxy_detected IS TRUE
+                       OR tor_detected IS TRUE
+                ) AS vpn_detected,
+                COUNT(*) FILTER (WHERE appeal_accepted=TRUE) AS appeals_accepted,
+                COUNT(*) FILTER (WHERE false_positive=TRUE) AS false_positives,
+                COUNT(*) AS total
+            FROM verification_attempts
+            WHERE guild_id=$1
+              AND created_at >= $2
+              AND created_at < $3
+            """,
+            guild_id,
+            month_start,
+            month_end,
+        )
 
 
 async def clear_verification_records(guild_id, user_id):

@@ -61,6 +61,41 @@ class VPNCheckResult:
     def available_count(self) -> int:
         return sum(verdict.available for verdict in self.verdicts)
 
+    @property
+    def unavailable_providers(self) -> tuple[str, ...]:
+        return tuple(
+            verdict.provider for verdict in self.verdicts if not verdict.available
+        )
+
+    @property
+    def status(self) -> str:
+        if self.available_count == 0:
+            return "not_evaluated"
+        if self.available_count == 1:
+            return "partial"
+        return "completed"
+
+    @property
+    def signal_types(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                signal
+                for verdict in self.verdicts
+                if verdict.available
+                for signal in verdict.signals
+            )
+        )
+
+    def provider_results(self) -> dict[str, dict]:
+        return {
+            verdict.provider: {
+                "available": verdict.available,
+                "detected": verdict.detected,
+                "signals": list(verdict.signals),
+            }
+            for verdict in self.verdicts
+        }
+
     def discord_summary(self) -> str:
         lines = []
         for verdict in self.verdicts:
@@ -113,7 +148,14 @@ def parse_proxycheck_response(payload: object, ip_address: str) -> ProviderVerdi
 
     signals = tuple(
         key
-        for key in ("vpn", "proxy", "tor", "anonymous")
+        for key in (
+            "vpn",
+            "proxy",
+            "tor",
+            "hosting",
+            "datacenter",
+            "anonymous",
+        )
         if detections.get(key) is True
     )
     return ProviderVerdict(
@@ -137,10 +179,16 @@ def parse_ipapi_response(payload: object, ip_address: str) -> ProviderVerdict:
         for field in checked_fields
         if payload[field]
     )
+    if payload.get("is_datacenter") is True:
+        signals += ("datacenter",)
+    if payload.get("is_hosting") is True:
+        signals += ("hosting",)
     return ProviderVerdict(
         provider=IPAPI_PROVIDER,
         available=True,
-        detected=bool(signals),
+        detected=any(
+            signal in {"vpn", "proxy", "tor"} for signal in signals
+        ),
         signals=signals,
     )
 

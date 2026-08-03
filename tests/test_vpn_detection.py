@@ -2,6 +2,8 @@ import unittest
 
 from core.vpn_detection import (
     InvalidProviderResponse,
+    ProviderVerdict,
+    VPNCheckResult,
     parse_ipapi_response,
     parse_proxycheck_response,
 )
@@ -39,7 +41,7 @@ class VPNDetectionParserTests(unittest.TestCase):
         )
 
         self.assertTrue(result.detected)
-        self.assertEqual(result.signals, ("proxy",))
+        self.assertEqual(result.signals, ("proxy", "datacenter"))
 
     def test_ipapi_does_not_reject_datacenter_alone(self):
         result = parse_ipapi_response(
@@ -54,6 +56,7 @@ class VPNDetectionParserTests(unittest.TestCase):
         )
 
         self.assertFalse(result.detected)
+        self.assertEqual(result.signals, ("datacenter",))
 
     def test_invalid_provider_payload_is_rejected(self):
         with self.assertRaises(InvalidProviderResponse):
@@ -75,6 +78,29 @@ class VPNDetectionParserTests(unittest.TestCase):
 
         self.assertTrue(result.available)
         self.assertFalse(result.detected)
+
+    def test_provider_details_preserve_partial_status(self):
+        result = VPNCheckResult(
+            proxycheck=ProviderVerdict(
+                provider="proxycheck.io",
+                available=True,
+                detected=False,
+            ),
+            ipapi=ProviderVerdict.unavailable("ipapi.is"),
+        )
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.unavailable_providers, ("ipapi.is",))
+        self.assertFalse(result.provider_results()["ipapi.is"]["available"])
+
+    def test_both_unavailable_are_not_evaluated(self):
+        result = VPNCheckResult(
+            proxycheck=ProviderVerdict.unavailable("proxycheck.io"),
+            ipapi=ProviderVerdict.unavailable("ipapi.is"),
+        )
+
+        self.assertEqual(result.status, "not_evaluated")
+        self.assertEqual(result.available_count, 0)
 
 
 if __name__ == "__main__":

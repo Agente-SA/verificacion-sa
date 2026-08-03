@@ -1,4 +1,5 @@
 import os
+import ipaddress
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -28,6 +29,20 @@ def _env_snowflake_set(name: str) -> frozenset[int]:
         if value.isdigit() and int(value) > 0:
             values.add(int(value))
     return frozenset(values)
+
+
+def _env_ip_networks(name: str, default: str) -> tuple:
+    networks = []
+    raw_values = os.getenv(name, default)
+    for raw_value in raw_values.split(","):
+        value = raw_value.strip()
+        if not value:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError as exc:
+            raise RuntimeError(f"{name} contiene una red invalida: {value}") from exc
+    return tuple(networks)
 
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -61,6 +76,13 @@ DATA_RETENTION_DAYS = max(1, _env_int("DATA_RETENTION_DAYS", 90))
 ANTIFRAUD_RETENTION_DAYS = max(1, _env_int("ANTIFRAUD_RETENTION_DAYS", 400))
 TOKEN_SECRET = os.getenv("TOKEN_SECRET", "").strip()
 IP_HASH_SECRET = os.getenv("IP_HASH_SECRET", "").strip()
+IP_HASH_SECRET_PREVIOUS = os.getenv("IP_HASH_SECRET_PREVIOUS", "").strip()
+IP_HASH_SECRET_VERSION = max(1, _env_int("IP_HASH_SECRET_VERSION", 1))
+
+TRUSTED_PROXY_NETWORKS = _env_ip_networks(
+    "TRUSTED_PROXY_CIDRS",
+    "127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+)
 
 API_HOST = os.getenv("HOST", "0.0.0.0").strip() or "0.0.0.0"
 API_PORT = _env_int("PORT", 80)
@@ -98,6 +120,16 @@ def get_configuration_errors() -> tuple[str, ...]:
         errors.append("TOKEN_SECRET debe tener al menos 32 caracteres")
     if IP_HASH_SECRET and len(IP_HASH_SECRET) < 32:
         errors.append("IP_HASH_SECRET debe tener al menos 32 caracteres")
+    if IP_HASH_SECRET_PREVIOUS and len(IP_HASH_SECRET_PREVIOUS) < 32:
+        errors.append(
+            "IP_HASH_SECRET_PREVIOUS debe tener al menos 32 caracteres"
+        )
+    if IP_HASH_SECRET_PREVIOUS and IP_HASH_SECRET_PREVIOUS == IP_HASH_SECRET:
+        errors.append(
+            "IP_HASH_SECRET_PREVIOUS debe ser diferente de IP_HASH_SECRET"
+        )
+    if not TRUSTED_PROXY_NETWORKS:
+        errors.append("TRUSTED_PROXY_CIDRS debe contener al menos una red")
     if not STAFF_ROLE_IDS:
         errors.append("STAFF_ROLE_IDS debe contener al menos un ID de rol")
     return tuple(errors)

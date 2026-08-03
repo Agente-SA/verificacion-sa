@@ -3,8 +3,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 
-REVIEW_THRESHOLD = 65
-HIGH_RISK_THRESHOLD = 85
+REVIEW_THRESHOLD = 30
+REJECTION_THRESHOLD = 65
 RECENT_WINDOW = timedelta(hours=24)
 RELATED_WINDOW = timedelta(days=7)
 EXACT_IP_REVIEW_WINDOW = timedelta(days=30)
@@ -13,8 +13,10 @@ NEW_SERVER_MEMBER_WINDOW = timedelta(days=30)
 NEW_ACCOUNT_SCORE = 5
 NEW_SERVER_MEMBER_SCORE = 5
 COUNTRY_NETWORK_MATCH_SCORE = 10
-VPN_SINGLE_PROVIDER_SCORE = 65
+VPN_SINGLE_PROVIDER_SCORE = 50
 VPN_MULTIPLE_PROVIDER_SCORE = 100
+VPN_PARTIAL_CHECK_SCORE = 5
+FINGERPRINT_MATCH_SCORE = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,10 @@ class RiskAssessment:
     @property
     def requires_review(self) -> bool:
         return self.decision == "review"
+
+    @property
+    def is_rejected(self) -> bool:
+        return self.decision == "rejected"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +67,18 @@ def _same_nonempty(current: Any, candidate: Any, key: str) -> bool:
     return bool(current_value) and current_value == candidate_value
 
 
+def _signal_matches(
+    current: Any,
+    candidate: Any,
+    key: str,
+    match_key: str,
+) -> bool:
+    explicit_match = _value(candidate, match_key)
+    if explicit_match is not None:
+        return bool(explicit_match)
+    return _same_nonempty(current, candidate, key)
+
+
 def _is_within_window(
     value: datetime | None,
     current_time: datetime,
@@ -80,6 +98,7 @@ def assess_verification_risk(
     account_created_at: datetime | None = None,
     server_joined_at: datetime | None = None,
     vpn_detected_by: Sequence[str] = (),
+    vpn_unavailable_by: Sequence[str] = (),
 ) -> RiskAssessment:
     current_time = _utc_datetime(now or datetime.now(timezone.utc))
     base_score = 0
@@ -107,6 +126,13 @@ def assess_verification_risk(
     for provider in vpn_providers:
         base_reasons.append(f"VPN/Proxy detectado por {provider}")
 
+    unavailable_providers = tuple(dict.fromkeys(vpn_unavailable_by))
+    if len(unavailable_providers) == 1:
+        base_score += VPN_PARTIAL_CHECK_SCORE
+        base_reasons.append(
+            f"Comprobacion VPN parcial: {unavailable_providers[0]} no disponible"
+        )
+
     related_users = {
         int(_value(candidate, "user_id"))
         for candidate in candidates
@@ -115,12 +141,17 @@ def assess_verification_risk(
     exact_ip_users = {
         int(_value(candidate, "user_id"))
         for candidate in candidates
-        if _same_nonempty(current, candidate, "ip_hash")
+        if _signal_matches(current, candidate, "ip_hash", "exact_ip_match")
     }
     network_users = {
         int(_value(candidate, "user_id"))
         for candidate in candidates
-        if _same_nonempty(current, candidate, "ip_network_hash")
+        if _signal_matches(
+            current,
+            candidate,
+            "ip_network_hash",
+            "network_match",
+        )
     }
 
     assessed_candidates = []
@@ -131,9 +162,24 @@ def assess_verification_risk(
 
         score = base_score
         reasons = list(base_reasons)
-        exact_ip = _same_nonempty(current, candidate, "ip_hash")
-        same_network = _same_nonempty(current, candidate, "ip_network_hash")
-        same_fingerprint = _same_nonempty(current, candidate, "fingerprint_hash")
+        exact_ip = _signal_matches(
+            current,
+            candidate,
+            "ip_hash",
+            "exact_ip_match",
+        )
+        same_network = _signal_matches(
+            current,
+            candidate,
+            "ip_network_hash",
+            "network_match",
+        )
+        same_fingerprint = _signal_matches(
+            current,
+            candidate,
+            "fingerprint_hash",
+            "fingerprint_match",
+        )
         same_country = _same_nonempty(current, candidate, "country_code")
 
         if exact_ip:
@@ -148,7 +194,7 @@ def assess_verification_risk(
             reasons.append("Pais coincidente junto a la conexion de red")
 
         if same_fingerprint:
-            score += 45
+            score += FINGERPRINT_MATCH_SCORE
             reasons.append("Huella tecnica limitada coincidente")
         else:
             context_matches = sum(
@@ -201,16 +247,22 @@ def assess_verification_risk(
 
     if not assessed_candidates:
         score = min(base_score, 100)
-        if score >= HIGH_RISK_THRESHOLD:
+        if score >= REJECTION_THRESHOLD:
             level = "high"
         elif score >= REVIEW_THRESHOLD:
             level = "medium"
         else:
             level = "low"
+        if score >= REJECTION_THRESHOLD:
+            decision = "rejected"
+        elif score >= REVIEW_THRESHOLD:
+            decision = "review"
+        else:
+            decision = "approved"
         return RiskAssessment(
             score=score,
             level=level,
-            decision="review" if score >= REVIEW_THRESHOLD else "approved",
+            decision=decision,
             possible_main_user_id=None,
             reasons=tuple(base_reasons),
             related_user_count=0,
@@ -224,19 +276,26 @@ def assess_verification_risk(
             -item.created_at.timestamp(),
         ),
     )
-    if strongest.score >= HIGH_RISK_THRESHOLD:
+    if strongest.score >= REJECTION_THRESHOLD:
         level = "high"
     elif strongest.score >= REVIEW_THRESHOLD:
         level = "medium"
     else:
         level = "low"
 
-    requires_review = strongest.score >= REVIEW_THRESHOLD
+    if strongest.score >= REJECTION_THRESHOLD:
+        decision = "rejected"
+    elif strongest.score >= REVIEW_THRESHOLD:
+        decision = "review"
+    else:
+        decision = "approved"
     return RiskAssessment(
         score=strongest.score,
         level=level,
-        decision="review" if requires_review else "approved",
-        possible_main_user_id=strongest.user_id if requires_review else None,
+        decision=decision,
+        possible_main_user_id=(
+            strongest.user_id if decision in {"review", "rejected"} else None
+        ),
         reasons=strongest.reasons,
         related_user_count=len(related_users),
     )

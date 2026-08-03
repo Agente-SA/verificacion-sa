@@ -15,7 +15,10 @@ from core.config import (
     DATA_RETENTION_DAYS,
     FRONTEND_URL,
     GUILD_ID,
+    IP_HASH_SECRET_VERSION,
     STAFF_CHANNEL_ID,
+    STAFF_ROLE_IDS,
+    TRUSTED_PROXY_NETWORKS,
     VERIFIED_ROLE_ID,
 )
 from core.verification_risk import RiskAssessment, assess_verification_risk
@@ -23,8 +26,11 @@ from core.verification_security import (
     InvalidVerificationToken,
     VerificationConfigurationError,
     hash_ip_address,
+    hash_ip_address_candidates,
     hash_ip_network,
+    hash_ip_network_candidates,
     hash_limited_fingerprint,
+    hash_limited_fingerprint_candidates,
     token_digest,
     validate_signed_verification_token,
 )
@@ -33,7 +39,7 @@ from core.vpn_detection import VPNCheckResult, check_vpn_services
 
 logger = logging.getLogger(__name__)
 API_NAME = "verification-sa-api"
-API_VERSION = 1
+API_VERSION = 2
 MAX_REQUEST_SIZE = 64 * 1024
 RATE_WINDOW = timedelta(minutes=15)
 USER_SUBMISSION_LIMIT = 5
@@ -172,20 +178,40 @@ def _os_family(user_agent: str) -> str:
     return "Other"
 
 
-def _client_ip(request: web.Request) -> str:
-    supplied_ip = request.headers.get("CF-Connecting-IP") or request.remote
-    if not supplied_ip:
+def _parse_ip(value: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    if not value:
         raise InvalidSubmission("Direccion de red no disponible.")
     try:
-        parsed_ip = ipaddress.ip_address(supplied_ip.strip())
+        parsed_ip = ipaddress.ip_address(value.strip())
     except ValueError as exc:
         raise InvalidSubmission("Direccion de red invalida.") from exc
     if isinstance(parsed_ip, ipaddress.IPv6Address) and parsed_ip.ipv4_mapped:
         parsed_ip = parsed_ip.ipv4_mapped
-    return parsed_ip.compressed
+    return parsed_ip
+
+
+def _request_uses_trusted_proxy(request: web.Request) -> bool:
+    remote_ip = _parse_ip(request.remote)
+    return any(remote_ip in network for network in TRUSTED_PROXY_NETWORKS)
+
+
+def _client_ip(request: web.Request) -> str:
+    forwarded_ip = request.headers.get("CF-Connecting-IP")
+    if forwarded_ip:
+        if not _request_uses_trusted_proxy(request):
+            logger.warning(
+                "Encabezado CF-Connecting-IP rechazado desde un proxy no confiable."
+            )
+            raise InvalidSubmission("Proxy de solicitud no confiable.")
+        return _parse_ip(forwarded_ip).compressed
+    return _parse_ip(request.remote).compressed
 
 
 def _country_code(request: web.Request) -> str | None:
+    if not request.headers.get("CF-Connecting-IP"):
+        return None
+    if not _request_uses_trusted_proxy(request):
+        return None
     country = request.headers.get("CF-IPCountry", "").strip().upper()
     return country if COUNTRY_CODE_PATTERN.fullmatch(country) else None
 
@@ -238,7 +264,11 @@ def _role_grant_diagnostics(
     )
 
 
-async def _grant_verified_role(member: discord.Member) -> bool:
+async def _grant_verified_role(
+    member: discord.Member,
+    *,
+    reason: str = "Verificacion SA aprobada automaticamente",
+) -> bool:
     guild = member.guild
     cached_bot_member = guild.me
     if cached_bot_member is None:
@@ -285,7 +315,7 @@ async def _grant_verified_role(member: discord.Member) -> bool:
     try:
         await fresh_member.add_roles(
             role,
-            reason="Verificacion SA aprobada automaticamente",
+            reason=reason,
         )
     except discord.HTTPException as exc:
         raise RoleGrantError(str(exc), diagnostics) from exc
@@ -323,7 +353,7 @@ async def _send_private_result(
     bot,
     token_id,
     user_id: int,
-    approved: bool,
+    outcome: str,
 ) -> None:
     manager = getattr(bot, "verification_manager", None)
     if manager is None:
@@ -337,7 +367,7 @@ async def _send_private_result(
         delivered = await manager.send_verification_result(
             token_id,
             user_id,
-            approved,
+            outcome,
         )
     except Exception:
         logger.exception(
@@ -365,16 +395,21 @@ async def _send_review_alert(
     if channel is None:
         raise RuntimeError("No se pudo localizar el canal de alertas del staff.")
 
+    manager = getattr(bot, "verification_manager", None)
+    if manager is None:
+        raise RuntimeError("No se pudo localizar el gestor de revisiones.")
+
+    staff_mentions = " ".join(
+        f"<@&{role_id}>" for role_id in sorted(STAFF_ROLE_IDS)
+    )
+
     main_user_id = assessment.possible_main_user_id
     if main_user_id is None:
-        content = (
-            f"Verificacion rechazada por VPN/Proxy {member.mention} "
-            f"({member.id})"
-        )
+        content = f"{staff_mentions} Revisión manual para {member.mention} ({member.id})"
         main_account_value = "No detectada"
     else:
         content = (
-            f"Posible ALT-ACCOUNT {member.mention} ({member.id}) - "
+            f"{staff_mentions} Posible ALT-ACCOUNT {member.mention} ({member.id}) - "
             f"Main Acc: <@{main_user_id}> ({main_user_id})"
         )
         main_account_value = f"<@{main_user_id}>\n`{main_user_id}`"
@@ -438,16 +473,114 @@ async def _send_review_alert(
             "La coincidencia es una senal preventiva y requiere revision humana."
         )
     )
-    await channel.send(
+    message = await channel.send(
         content,
         embed=embed,
+        view=manager.manual_review_view(attempt_id),
         allowed_mentions=discord.AllowedMentions(
             everyone=False,
             users=True,
-            roles=False,
+            roles=[discord.Object(id=role_id) for role_id in STAFF_ROLE_IDS],
             replied_user=False,
         ),
     )
+    saved = await database.save_manual_review_message(
+        attempt_id,
+        channel.id,
+        message.id,
+    )
+    if saved is None:
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        raise RuntimeError("La revisión dejó de estar pendiente antes de publicarse.")
+
+
+async def _send_rejection_alert(
+    bot,
+    member: discord.Member,
+    assessment: RiskAssessment,
+    attempt_id: int,
+    country_code: str | None,
+    vpn_check: VPNCheckResult,
+) -> None:
+    channel = await _staff_channel(bot)
+    if channel is None:
+        raise RuntimeError("No se pudo localizar el canal de alertas del staff.")
+    main_account = (
+        f"<@{assessment.possible_main_user_id}> (`{assessment.possible_main_user_id}`)"
+        if assessment.possible_main_user_id
+        else "No detectada"
+    )
+    reasons = "\n".join(f"- {reason}" for reason in assessment.reasons)
+    embed = discord.Embed(
+        title="Verificación SA rechazada",
+        description=f"Solicitud de {member.mention} (`{member.id}`)",
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Riesgo",
+        value=f"{assessment.level.upper()} ({assessment.score}/100)",
+        inline=True,
+    )
+    embed.add_field(
+        name="Posible cuenta principal",
+        value=main_account,
+        inline=True,
+    )
+    embed.add_field(
+        name="Verificación interna",
+        value=f"`{attempt_id}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="Coincidencias",
+        value=reasons[:1024] or "Sin motivos detallados",
+        inline=False,
+    )
+    embed.add_field(
+        name="VPN / Proxy",
+        value=vpn_check.discord_summary(),
+        inline=True,
+    )
+    embed.add_field(
+        name="País aproximado",
+        value=country_code or "No disponible",
+        inline=True,
+    )
+    await channel.send(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _send_vpn_unavailable_alert(
+    bot,
+    member: discord.Member,
+    attempt_id: int,
+    vpn_check: VPNCheckResult,
+) -> None:
+    channel = await _staff_channel(bot)
+    if channel is None:
+        raise RuntimeError("No se pudo localizar el canal de alertas del staff.")
+    embed = discord.Embed(
+        title="Verificación SA no evaluada",
+        description=(
+            f"La solicitud de {member.mention} (`{member.id}`) debe repetirse "
+            "porque ambos proveedores VPN estuvieron indisponibles."
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Proveedores",
+        value=vpn_check.discord_summary(),
+        inline=False,
+    )
+    embed.set_footer(text=f"Verificación interna: {attempt_id}")
+    await channel.send(embed=embed)
 
 
 async def _send_role_error_alert(
@@ -586,14 +719,16 @@ def create_verification_app(bot) -> web.Application:
                 bot,
                 verification_token.token_id,
                 verification_token.user_id,
-                approved=True,
+                "approved",
             )
             return web.json_response({"status": "completed"})
 
         try:
             client_ip = _client_ip(request)
             ip_hash = hash_ip_address(client_ip)
+            ip_hashes = hash_ip_address_candidates(client_ip)
             ip_network_hash = hash_ip_network(client_ip)
+            ip_network_hashes = hash_ip_network_candidates(client_ip)
             browser_family = _browser_family(signals["user_agent"])
             os_family = _os_family(signals["user_agent"])
             fingerprint_basis = {
@@ -608,191 +743,189 @@ def create_verification_app(bot) -> web.Application:
                 "touch_support": signals["touch_support"],
             }
             fingerprint_hash = hash_limited_fingerprint(fingerprint_basis)
+            fingerprint_hashes = hash_limited_fingerprint_candidates(
+                fingerprint_basis
+            )
+            country_code = _country_code(request)
         except (InvalidSubmission, VerificationConfigurationError):
             return _error_response("temporarily_unavailable", 503)
 
         current_time = datetime.now(timezone.utc)
-        try:
-            user_count, ip_count = await database.get_verification_submission_counts(
-                verification_token.guild_id,
-                verification_token.user_id,
-                ip_hash,
-                current_time - RATE_WINDOW,
-            )
-            if user_count >= USER_SUBMISSION_LIMIT or ip_count >= IP_SUBMISSION_LIMIT:
-                return _error_response("too_many_requests", 429)
-
-            attempt = await database.record_pending_verification_attempt(
-                token_id=verification_token.token_id,
-                token_digest=supplied_digest,
-                guild_id=verification_token.guild_id,
-                user_id=verification_token.user_id,
-                discord_tag=str(member)[:128],
-                ip_hash=ip_hash,
-                ip_network_hash=ip_network_hash,
-                fingerprint_hash=fingerprint_hash,
-                country_code=_country_code(request),
-                region=None,
-                timezone_name=signals["timezone"],
-                language=signals["language"],
-                browser_family=browser_family,
-                os_family=os_family,
-                device_type=signals["device_class"],
-                signals={
-                    "signal_version": signals["signal_version"],
-                    "platform": signals["platform"],
-                    "mobile": signals["mobile"],
-                    "touch_support": signals["touch_support"],
-                },
-                retention_until=current_time + timedelta(days=DATA_RETENTION_DAYS),
-            )
-        except Exception:
-            logger.exception(
-                "No se pudo registrar la solicitud de verificacion del usuario %s.",
-                verification_token.user_id,
-            )
-            return _error_response("temporarily_unavailable", 503)
-
-        if attempt is None:
-            return _error_response("invalid_or_expired_link", 400)
-
         vpn_check = await check_vpn_services(client_ip)
-        if vpn_check.available_count == 0:
-            logger.warning(
-                "Evaluacion VPN omitida temporalmente | usuario=%s | intento=%s",
-                verification_token.user_id,
-                attempt["id"],
-            )
-
+        attempt = None
+        assessment = None
+        role_added = False
+        role_error = None
         try:
-            candidates = await database.get_verification_match_candidates(
-                verification_token.guild_id,
-                verification_token.user_id,
+            async with database.verification_signal_transaction(
                 ip_hash,
                 ip_network_hash,
-                fingerprint_hash,
-            )
-            assessment = assess_verification_risk(
-                attempt,
-                candidates,
-                now=current_time,
-                account_created_at=member.created_at,
-                server_joined_at=member.joined_at,
-                vpn_detected_by=vpn_check.detected_providers,
-            )
-            logger.info(
-                (
-                    "Verificacion evaluada | usuario=%s | intento=%s | "
-                    "decision=%s | riesgo=%s/100 | relacionadas=%s | motivos=%s"
-                ),
-                verification_token.user_id,
-                attempt["id"],
-                assessment.decision,
-                assessment.score,
-                assessment.related_user_count,
-                ", ".join(assessment.reasons) or "sin coincidencias",
-            )
+            ) as conn:
+                user_count, ip_count = (
+                    await database.get_verification_submission_counts(
+                        verification_token.guild_id,
+                        verification_token.user_id,
+                        ip_hashes,
+                        current_time - RATE_WINDOW,
+                        conn=conn,
+                    )
+                )
+                if (
+                    user_count >= USER_SUBMISSION_LIMIT
+                    or ip_count >= IP_SUBMISSION_LIMIT
+                ):
+                    return _error_response("too_many_requests", 429)
+
+                attempt = await database.record_pending_verification_attempt(
+                    token_id=verification_token.token_id,
+                    token_digest=supplied_digest,
+                    guild_id=verification_token.guild_id,
+                    user_id=verification_token.user_id,
+                    discord_tag=str(member)[:128],
+                    ip_hash=ip_hash,
+                    ip_network_hash=ip_network_hash,
+                    fingerprint_hash=fingerprint_hash,
+                    country_code=country_code,
+                    region=None,
+                    timezone_name=signals["timezone"],
+                    language=signals["language"],
+                    browser_family=browser_family,
+                    os_family=os_family,
+                    device_type=signals["device_class"],
+                    signals={
+                        "signal_version": signals["signal_version"],
+                        "platform": signals["platform"],
+                        "mobile": signals["mobile"],
+                        "touch_support": signals["touch_support"],
+                    },
+                    retention_until=(
+                        current_time + timedelta(days=DATA_RETENTION_DAYS)
+                    ),
+                    hash_key_version=IP_HASH_SECRET_VERSION,
+                    vpn_check_status=vpn_check.status,
+                    vpn_provider_results=vpn_check.provider_results(),
+                    vpn_checked_at=current_time,
+                    vpn_signal_types=vpn_check.signal_types,
+                    vpn_detected=bool(vpn_check.detected_providers),
+                    conn=conn,
+                )
+                if attempt is None:
+                    return _error_response("invalid_or_expired_link", 400)
+
+                if vpn_check.available_count == 0:
+                    await database.finalize_verification_attempt(
+                        attempt["id"],
+                        risk_score=0,
+                        risk_level="low",
+                        decision="error",
+                        role_granted=False,
+                        possible_main_user_id=None,
+                        risk_reasons=[
+                            "Proveedores VPN no disponibles; se requiere reintento"
+                        ],
+                        conn=conn,
+                    )
+                else:
+                    candidates = (
+                        await database.get_verification_match_candidates(
+                            verification_token.guild_id,
+                            verification_token.user_id,
+                            ip_hashes,
+                            ip_network_hashes,
+                            fingerprint_hashes,
+                            conn=conn,
+                        )
+                    )
+                    assessment = assess_verification_risk(
+                        attempt,
+                        candidates,
+                        now=current_time,
+                        account_created_at=member.created_at,
+                        server_joined_at=member.joined_at,
+                        vpn_detected_by=vpn_check.detected_providers,
+                        vpn_unavailable_by=vpn_check.unavailable_providers,
+                    )
+                    logger.info(
+                        (
+                            "Verificacion evaluada | usuario=%s | intento=%s | "
+                            "decision=%s | riesgo=%s/100 | relacionadas=%s | "
+                            "vpn=%s | motivos=%s"
+                        ),
+                        verification_token.user_id,
+                        attempt["id"],
+                        assessment.decision,
+                        assessment.score,
+                        assessment.related_user_count,
+                        vpn_check.status,
+                        ", ".join(assessment.reasons) or "sin coincidencias",
+                    )
+
+                    if assessment.requires_review:
+                        await database.finalize_verification_attempt(
+                            attempt["id"],
+                            risk_score=assessment.score,
+                            risk_level=assessment.level,
+                            decision="review",
+                            role_granted=False,
+                            possible_main_user_id=(
+                                assessment.possible_main_user_id
+                            ),
+                            risk_reasons=list(assessment.reasons),
+                            manual_review_required=True,
+                            manual_review_status="pending",
+                            conn=conn,
+                        )
+                    elif assessment.is_rejected:
+                        await database.finalize_verification_attempt(
+                            attempt["id"],
+                            risk_score=assessment.score,
+                            risk_level=assessment.level,
+                            decision="rejected",
+                            role_granted=False,
+                            possible_main_user_id=(
+                                assessment.possible_main_user_id
+                            ),
+                            risk_reasons=list(assessment.reasons),
+                            conn=conn,
+                        )
+                    else:
+                        try:
+                            role_added = await _grant_verified_role(member)
+                        except (RoleGrantError, discord.HTTPException) as exc:
+                            role_error = exc
+                            await database.finalize_verification_attempt(
+                                attempt["id"],
+                                risk_score=assessment.score,
+                                risk_level=assessment.level,
+                                decision="error",
+                                role_granted=False,
+                                possible_main_user_id=None,
+                                risk_reasons=[
+                                    "No fue posible otorgar el rol verificado"
+                                ],
+                                conn=conn,
+                            )
+                        else:
+                            finalized = (
+                                await database.finalize_verification_attempt(
+                                    attempt["id"],
+                                    risk_score=assessment.score,
+                                    risk_level=assessment.level,
+                                    decision="approved",
+                                    role_granted=True,
+                                    possible_main_user_id=None,
+                                    risk_reasons=list(assessment.reasons),
+                                    conn=conn,
+                                )
+                            )
+                            if finalized is None:
+                                raise RuntimeError(
+                                    "La verificacion pendiente ya no existe."
+                                )
         except Exception:
             logger.exception(
-                "No se pudo evaluar el riesgo de la verificacion %s.",
-                attempt["id"],
-            )
-            return _error_response("temporarily_unavailable", 503)
-
-        if assessment.requires_review:
-            try:
-                await database.finalize_verification_attempt(
-                    attempt["id"],
-                    risk_score=assessment.score,
-                    risk_level=assessment.level,
-                    decision="review",
-                    role_granted=False,
-                    possible_main_user_id=assessment.possible_main_user_id,
-                    risk_reasons=list(assessment.reasons),
-                )
-            except Exception:
-                logger.exception(
-                    "No se pudo finalizar la verificacion en revision %s.",
-                    attempt["id"],
-                )
-                return _error_response("temporarily_unavailable", 503)
-
-            await _send_private_result(
-                bot,
-                verification_token.token_id,
+                "No se pudo evaluar o finalizar la solicitud del usuario %s.",
                 verification_token.user_id,
-                approved=False,
-            )
-            try:
-                await _send_review_alert(
-                    bot,
-                    member,
-                    assessment,
-                    attempt["id"],
-                    attempt["country_code"],
-                    vpn_check,
-                )
-            except Exception:
-                logger.exception(
-                    "No se pudo enviar la alerta de la verificacion %s.",
-                    attempt["id"],
-                )
-            return web.json_response({"status": "accepted"}, status=202)
-
-        role_added = False
-        try:
-            role_added = await _grant_verified_role(member)
-        except (RoleGrantError, discord.HTTPException) as exc:
-            logger.exception(
-                "No se pudo otorgar el rol de verificacion al usuario %s.",
-                member.id,
-            )
-            try:
-                await database.finalize_verification_attempt(
-                    attempt["id"],
-                    risk_score=assessment.score,
-                    risk_level=assessment.level,
-                    decision="error",
-                    role_granted=False,
-                    possible_main_user_id=None,
-                    risk_reasons=["No fue posible otorgar el rol verificado"],
-                )
-                await _send_role_error_alert(
-                    bot,
-                    member,
-                    attempt["id"],
-                    str(exc),
-                    getattr(exc, "diagnostics", None),
-                )
-            except Exception:
-                logger.exception(
-                    "No se pudo registrar o alertar el error de rol de %s.",
-                    attempt["id"],
-                )
-            await _send_private_result(
-                bot,
-                verification_token.token_id,
-                verification_token.user_id,
-                approved=False,
-            )
-            return web.json_response({"status": "accepted"}, status=202)
-
-        try:
-            finalized = await database.finalize_verification_attempt(
-                attempt["id"],
-                risk_score=assessment.score,
-                risk_level=assessment.level,
-                decision="approved",
-                role_granted=True,
-                possible_main_user_id=None,
-                risk_reasons=list(assessment.reasons),
-            )
-            if finalized is None:
-                raise RuntimeError("La verificacion pendiente ya no existe.")
-        except Exception:
-            logger.exception(
-                "No se pudo guardar la aprobacion de la verificacion %s.",
-                attempt["id"],
             )
             if role_added:
                 try:
@@ -804,11 +937,139 @@ def create_verification_app(bot) -> web.Application:
                     )
             return _error_response("temporarily_unavailable", 503)
 
+        if attempt is None:
+            return _error_response("temporarily_unavailable", 503)
+
+        if vpn_check.available_count == 0:
+            await _send_private_result(
+                bot,
+                verification_token.token_id,
+                verification_token.user_id,
+                "retry",
+            )
+            try:
+                await _send_vpn_unavailable_alert(
+                    bot,
+                    member,
+                    attempt["id"],
+                    vpn_check,
+                )
+            except Exception:
+                logger.exception(
+                    "No se pudo notificar la indisponibilidad VPN %s.",
+                    attempt["id"],
+                )
+            return _error_response("temporarily_unavailable", 503)
+
+        if role_error is not None:
+            logger.error(
+                "No se pudo otorgar el rol de verificacion al usuario %s.",
+                member.id,
+                exc_info=role_error,
+            )
+            try:
+                await _send_role_error_alert(
+                    bot,
+                    member,
+                    attempt["id"],
+                    str(role_error),
+                    getattr(role_error, "diagnostics", None),
+                )
+            except Exception:
+                logger.exception(
+                    "No se pudo enviar la alerta del error de rol %s.",
+                    attempt["id"],
+                )
+            await _send_private_result(
+                bot,
+                verification_token.token_id,
+                verification_token.user_id,
+                "retry",
+            )
+            return _error_response("temporarily_unavailable", 503)
+
+        if assessment is None:
+            return _error_response("temporarily_unavailable", 503)
+
+        if assessment.requires_review:
+            try:
+                await _send_review_alert(
+                    bot,
+                    member,
+                    assessment,
+                    attempt["id"],
+                    country_code,
+                    vpn_check,
+                )
+            except Exception:
+                logger.exception(
+                    "No se pudo publicar la revision manual %s.",
+                    attempt["id"],
+                )
+                try:
+                    await database.finalize_verification_attempt(
+                        attempt["id"],
+                        risk_score=assessment.score,
+                        risk_level=assessment.level,
+                        decision="error",
+                        role_granted=False,
+                        possible_main_user_id=(
+                            assessment.possible_main_user_id
+                        ),
+                        risk_reasons=[
+                            *assessment.reasons,
+                            "No fue posible publicar la revisión manual",
+                        ],
+                    )
+                except Exception:
+                    logger.exception(
+                        "No se pudo cancelar la revision manual %s.",
+                        attempt["id"],
+                    )
+                await _send_private_result(
+                    bot,
+                    verification_token.token_id,
+                    verification_token.user_id,
+                    "retry",
+                )
+                return _error_response("temporarily_unavailable", 503)
+
+            await _send_private_result(
+                bot,
+                verification_token.token_id,
+                verification_token.user_id,
+                "review",
+            )
+            return web.json_response({"status": "review"}, status=202)
+
+        if assessment.is_rejected:
+            await _send_private_result(
+                bot,
+                verification_token.token_id,
+                verification_token.user_id,
+                "rejected",
+            )
+            try:
+                await _send_rejection_alert(
+                    bot,
+                    member,
+                    assessment,
+                    attempt["id"],
+                    country_code,
+                    vpn_check,
+                )
+            except Exception:
+                logger.exception(
+                    "No se pudo enviar el rechazo al staff %s.",
+                    attempt["id"],
+                )
+            return web.json_response({"status": "rejected"}, status=202)
+
         await _send_private_result(
             bot,
             verification_token.token_id,
             verification_token.user_id,
-            approved=True,
+            "approved",
         )
         try:
             await _send_success_alert(bot, member)
@@ -817,8 +1078,7 @@ def create_verification_app(bot) -> web.Application:
                 "No se pudo enviar el aviso de verificacion exitosa %s.",
                 attempt["id"],
             )
-
-        return web.json_response({"status": "accepted"}, status=202)
+        return web.json_response({"status": "approved"}, status=202)
 
     async def options(_request: web.Request) -> web.Response:
         return web.Response(status=204)

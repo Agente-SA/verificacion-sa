@@ -41,8 +41,10 @@ La URL de Neon puede copiarse completa. La aplicacion retira automaticamente
 `channel_binding`, que no es una opcion de conexion reconocida por `asyncpg`, y
 conserva `sslmode=require`.
 
-`STAFF_ROLE_IDS` acepta uno o varios IDs separados por comas. El propietario
-del servidor tambien puede ejecutar los comandos de staff.
+`STAFF_ROLE_IDS` acepta uno o varios IDs separados por comas. Esos roles
+pueden resolver revisiones manuales y usar `/metricas`; el propietario del
+servidor tambien conserva acceso. Para que Discord muestre la mencion en una
+revision, al menos uno de esos roles debe ser mencionable por el bot.
 
 Los secretos se generan por separado:
 
@@ -50,9 +52,31 @@ Los secretos se generan por separado:
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-No reutilices `TOKEN_SECRET`. Para conservar coincidencias historicas durante
-una migracion, `IP_HASH_SECRET` debe ser el mismo que genero los hashes
-anteriores; si se cambia, la nueva base debe comenzar sin esos hashes.
+No reutilices `TOKEN_SECRET`. Los hashes de red admiten una rotacion gradual:
+
+1. Conserva la clave anterior en `IP_HASH_SECRET_PREVIOUS`.
+2. Coloca la clave nueva en `IP_HASH_SECRET`.
+3. Incrementa `IP_HASH_SECRET_VERSION`.
+4. Retira la clave anterior cuando haya expirado la retencion historica que
+   fue creada con ella.
+
+`TRUSTED_PROXY_CIDRS` limita quien puede aportar `CF-Connecting-IP` y
+`CF-IPCountry`. El valor de ejemplo admite loopback y redes privadas usadas
+normalmente entre el proxy y la aplicacion. Si Square Cloud cambia esa ruta,
+debe agregarse exclusivamente el CIDR confirmado por el proveedor; nunca se
+debe usar `0.0.0.0/0` ni `::/0`.
+
+## Decisiones y revision
+
+- Riesgo menor de 30: aprobacion automatica.
+- Riesgo de 30 a 64: revision manual persistente en el canal de staff.
+- Riesgo de 65 o mas: rechazo automatico.
+- Un proveedor VPN positivo envia a revision; dos positivos rechazan.
+- Si ambos proveedores VPN fallan, no se decide y se solicita otro intento.
+
+Las revisiones conservan botones de Aceptar y Rechazar despues de reinicios.
+Solo la aceptacion otorga el rol. `/metricas` consulta los resultados del mes
+UTC que aun se encuentran dentro de la retencion detallada.
 
 ## Desarrollo local
 
