@@ -232,7 +232,8 @@ def _role_grant_diagnostics(
         f"Manage Roles: `{permissions.manage_roles}` | "
         f"Administrator: `{permissions.administrator}`\n"
         f"Usuario objetivo: {member.mention} (`{member.id}`) | "
-        f"rol superior `{target_top_role.name}` (`{target_top_role.id}`) | "
+        f"rol superior `{target_top_role.name}` (`{target_top_role.id}`, "
+        f"posicion `{target_top_role.position}`) | "
         f"owner=`{guild.owner_id == member.id}` | pending=`{member.pending}`"
     )
 
@@ -281,11 +282,34 @@ async def _grant_verified_role(member: discord.Member) -> bool:
     if fresh_member.get_role(role.id) is not None:
         return False
 
+    reason = "Verificacion SA aprobada automaticamente"
     try:
-        await fresh_member.add_roles(
-            role,
-            reason="Verificacion SA aprobada automaticamente",
+        await fresh_member.add_roles(role, reason=reason)
+    except discord.Forbidden as direct_error:
+        if direct_error.code != 50001:
+            raise RoleGrantError(str(direct_error), diagnostics) from direct_error
+
+        logger.warning(
+            (
+                "Discord rechazo el endpoint directo de rol para %s; "
+                "intentando actualizacion completa del miembro."
+            ),
+            fresh_member.id,
         )
+        try:
+            await fresh_member.add_roles(
+                role,
+                reason=reason,
+                atomic=False,
+            )
+        except discord.HTTPException as fallback_error:
+            raise RoleGrantError(
+                (
+                    f"Endpoint directo: {direct_error}; "
+                    f"actualizacion del miembro: {fallback_error}"
+                ),
+                diagnostics,
+            ) from fallback_error
     except discord.HTTPException as exc:
         raise RoleGrantError(str(exc), diagnostics) from exc
     return True
