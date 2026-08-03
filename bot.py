@@ -12,6 +12,24 @@ from modules import verificacion
 
 logger = logging.getLogger(__name__)
 
+DISCORD_LOGIN_RETRY_INITIAL_SECONDS = 120
+DISCORD_LOGIN_RETRY_MAX_SECONDS = 900
+
+
+def _discord_login_retry_delay(error: discord.HTTPException, attempt: int) -> float:
+    retry_after = error.response.headers.get("Retry-After")
+    try:
+        requested_delay = float(retry_after) if retry_after is not None else 0.0
+    except (TypeError, ValueError):
+        requested_delay = 0.0
+
+    exponential_delay = min(
+        DISCORD_LOGIN_RETRY_MAX_SECONDS,
+        DISCORD_LOGIN_RETRY_INITIAL_SECONDS
+        * (2 ** min(max(attempt - 1, 0), 3)),
+    )
+    return max(requested_delay, exponential_delay)
+
 
 class VerificationBot(commands.Bot):
     def __init__(self) -> None:
@@ -86,10 +104,33 @@ async def on_ready() -> None:
     print("✅ Enlace con Discord establecido. Sistema de verificación listo.")
 
 
+async def run_guardian() -> None:
+    attempt = 0
+    async with bot:
+        while True:
+            try:
+                await bot.start(DISCORD_TOKEN)
+                return
+            except discord.HTTPException as error:
+                # Cloudflare can temporarily rate-limit a hosting IP before Discord
+                # identifies the bot. Keep this process alive to avoid a restart loop.
+                if error.status != 429 or bot.user is not None:
+                    raise
+
+                attempt += 1
+                delay = _discord_login_retry_delay(error, attempt)
+                logger.warning(
+                    "Discord limitó temporalmente el inicio de sesión (HTTP 429). "
+                    "Nuevo intento en %.0f segundos; Guardian permanecerá activo.",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("discord").setLevel(logging.WARNING)
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    asyncio.run(run_guardian())
