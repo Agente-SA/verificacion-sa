@@ -196,6 +196,13 @@ h2 {
   flex: 0 0 auto;
 }
 
+.legal-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 14px;
+}
+
 .consent-control {
   display: grid;
   grid-template-columns: 20px 1fr;
@@ -367,6 +374,10 @@ h2 {
   margin-bottom: 0;
 }
 
+.legal-content section a {
+  overflow-wrap: anywhere;
+}
+
 .site-footer {
   border-top-style: solid;
   border-top-width: 1px;
@@ -472,6 +483,11 @@ h2 {
 
   .privacy-inline {
     display: block;
+  }
+
+  .legal-links {
+    justify-content: flex-start;
+    gap: 16px;
   }
 
   .privacy-inline a {

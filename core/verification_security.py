@@ -66,19 +66,20 @@ def _token_secret_bytes() -> bytes:
     return TOKEN_SECRET.encode("utf-8")
 
 
-def _privacy_secret_bytes(secret: str = IP_HASH_SECRET) -> bytes:
-    if len(secret) < PRIVACY_SECRET_MIN_LENGTH:
+def _privacy_secret_bytes(secret: str | None = None) -> bytes:
+    active_secret = IP_HASH_SECRET if secret is None else secret
+    if len(active_secret) < PRIVACY_SECRET_MIN_LENGTH:
         raise VerificationConfigurationError(
             "IP_HASH_SECRET debe contener al menos 32 caracteres."
         )
-    return secret.encode("utf-8")
+    return active_secret.encode("utf-8")
 
 
 def _privacy_digest(
     namespace: str,
     value: str,
     *,
-    secret: str = IP_HASH_SECRET,
+    secret: str | None = None,
 ) -> str:
     message = f"{namespace}\0{value}".encode("utf-8")
     return hmac.new(
