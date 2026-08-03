@@ -35,17 +35,9 @@
         <p>Regresa a Discord y genera uno nuevo.</p>
       </div>
 
-      <div class="privacy-inline">
-        <span>Antes de continuar, revisa:</span>
-        <div class="legal-links">
-          <a href="privacy.html" target="_blank" rel="noopener noreferrer">Privacidad</a>
-          <a href="terms.html" target="_blank" rel="noopener noreferrer">Términos</a>
-        </div>
-      </div>
-
       <label class="consent-control" for="privacy-consent">
         <input id="privacy-consent" type="checkbox">
-        <span>He leído el aviso de privacidad y los términos de verificación, y deseo continuar.</span>
+        <span>He leído los términos de verificación y privacidad y deseo continuar...</span>
       </label>
 
       <div id="status-message" class="status-message is-hidden" role="status" aria-live="polite"></div>
@@ -56,6 +48,11 @@
       </button>
 
       <p class="security-note">Nunca te pediremos tu contraseña de Discord.</p>
+
+      <nav class="verification-footer-links" aria-label="Documentos legales">
+        <a href="privacy.html" target="_blank" rel="noopener noreferrer">Privacidad</a>
+        <a href="terms.html" target="_blank" rel="noopener noreferrer">Términos</a>
+      </nav>
     </section>
 
     <section id="success-panel" class="verification-card result-panel is-hidden" aria-labelledby="success-title">

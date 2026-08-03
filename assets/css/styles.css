@@ -179,36 +179,12 @@ h2 {
   font-size: 16px;
 }
 
-.privacy-inline {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
-  margin-top: 26px;
-  padding-block: 15px;
-  border-top: 1px solid rgba(255, 255, 255, 0.12);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
-  color: #c9d2df;
-  font-size: 13px;
-}
-
-.privacy-inline a {
-  flex: 0 0 auto;
-}
-
-.legal-links {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 14px;
-}
-
 .consent-control {
   display: grid;
   grid-template-columns: 20px 1fr;
   gap: 11px;
   align-items: start;
-  margin-top: 20px;
+  margin-top: 38px;
   color: #e3e8f0;
   font-size: 14px;
   cursor: pointer;
@@ -259,6 +235,16 @@ h2 {
   color: #949fb1;
   font-size: 12px;
   text-align: center;
+}
+
+.verification-footer-links {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  margin-top: 6px;
+  padding-top: 3px;
+  font-size: 13px;
 }
 
 .status-message,
@@ -435,10 +421,6 @@ h2 {
     overflow-wrap: anywhere;
   }
 
-  .privacy-inline {
-    align-items: flex-start;
-  }
-
   .consent-control {
     grid-template-columns: 22px 1fr;
     font-size: 15px;
@@ -475,26 +457,9 @@ h2 {
   }
 
   .card-brand span,
-  .brand-name,
-  .privacy-inline span {
+  .brand-name {
     max-width: 100%;
     overflow-wrap: anywhere;
-  }
-
-  .privacy-inline {
-    display: block;
-  }
-
-  .legal-links {
-    justify-content: flex-start;
-    gap: 16px;
-  }
-
-  .privacy-inline a {
-    min-height: 44px;
-    display: inline-flex;
-    align-items: center;
-    margin-top: 5px;
   }
 
   .header-inner {
