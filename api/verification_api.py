@@ -22,7 +22,9 @@ from core.config import (
     FRONTEND_URL,
     GUILD_ID,
     IP_HASH_SECRET_VERSION,
+    LEGACY_VERIFIED_ROLE_ID,
     OAUTH_STATE_EXPIRATION_MINUTES,
+    REGIONAL_REVIEW_ROLE_IDS,
     STAFF_CHANNEL_ID,
     STAFF_ROLE_IDS,
     TRUSTED_PROXY_NETWORKS,
@@ -244,6 +246,33 @@ def _load_oauth_signals(value: object) -> dict:
     return value
 
 
+def _member_regional_review_role_ids(member: discord.Member) -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            role.id
+            for role in member.roles
+            if role.id in REGIONAL_REVIEW_ROLE_IDS
+        )
+    )
+
+
+def _force_regional_manual_review(
+    assessment: RiskAssessment,
+    role_ids: tuple[int, ...],
+) -> RiskAssessment:
+    if not role_ids:
+        return assessment
+    reason = "Rol regional sujeto a revisión manual obligatoria"
+    return RiskAssessment(
+        score=assessment.score,
+        level=assessment.level,
+        decision="review",
+        possible_main_user_id=assessment.possible_main_user_id,
+        reasons=tuple(dict.fromkeys((*assessment.reasons, reason))),
+        related_user_count=assessment.related_user_count,
+    )
+
+
 def _browser_family(user_agent: str) -> str:
     lowered = user_agent.lower()
     if "edg/" in lowered or "edgios/" in lowered or "edga/" in lowered:
@@ -409,16 +438,52 @@ async def _grant_verified_role(
             "El rol del bot no esta por encima del rol verificado.",
             diagnostics,
         )
-    if fresh_member.get_role(role.id) is not None:
-        return False
+    role_added = fresh_member.get_role(role.id) is None
+    if role_added:
+        try:
+            await fresh_member.add_roles(
+                role,
+                reason=reason,
+            )
+            fresh_member = await guild.fetch_member(member.id)
+        except discord.HTTPException as exc:
+            raise RoleGrantError(str(exc), diagnostics) from exc
+        if fresh_member.get_role(role.id) is None:
+            raise RoleGrantError(
+                "Discord no confirmó la asignación del rol verificado.",
+                diagnostics,
+            )
 
     try:
-        await fresh_member.add_roles(
-            role,
-            reason=reason,
+        await _remove_legacy_verified_role(
+            fresh_member,
+            roles,
+            reason="Retiro del rol de verificación antiguo",
         )
     except discord.HTTPException as exc:
-        raise RoleGrantError(str(exc), diagnostics) from exc
+        raise RoleGrantError(
+            (
+                "El rol verificado fue confirmado, pero no se pudo retirar "
+                f"el rol antiguo: {exc}"
+            ),
+            diagnostics,
+        ) from exc
+    return role_added
+
+
+async def _remove_legacy_verified_role(
+    member: discord.Member,
+    roles: list[discord.Role],
+    *,
+    reason: str,
+) -> bool:
+    legacy_role = discord.utils.get(roles, id=LEGACY_VERIFIED_ROLE_ID)
+    if legacy_role is None:
+        return False
+    if member.get_role(legacy_role.id) is None:
+        return False
+
+    await member.remove_roles(legacy_role, reason=reason)
     return True
 
 
@@ -524,6 +589,7 @@ async def _send_review_alert(
     attempt_id: int,
     country_code: str | None,
     vpn_check: VPNCheckResult,
+    regional_role_ids: tuple[int, ...] = (),
 ) -> None:
     channel = await _staff_channel(bot)
     if channel is None:
@@ -602,6 +668,15 @@ async def _send_review_alert(
         value=country_value,
         inline=True,
     )
+    if regional_role_ids:
+        embed.add_field(
+            name="Roles regionales detectados",
+            value="\n".join(
+                f"<@&{role_id}> (`{role_id}`)"
+                for role_id in regional_role_ids
+            ),
+            inline=False,
+        )
     embed.set_footer(
         text=(
             "La coincidencia es una senal preventiva y requiere revision humana."
@@ -851,6 +926,8 @@ def create_verification_app(bot) -> web.Application:
             )
             return web.json_response({"status": "completed"})
 
+        regional_review_role_ids = _member_regional_review_role_ids(member)
+
         try:
             client_ip = _client_ip(request)
             ip_hash = hash_ip_address(client_ip)
@@ -923,6 +1000,9 @@ def create_verification_app(bot) -> web.Application:
                         "platform": signals["platform"],
                         "mobile": signals["mobile"],
                         "touch_support": signals["touch_support"],
+                        "regional_review_role_ids": list(
+                            regional_review_role_ids
+                        ),
                     },
                     retention_until=(
                         current_time + timedelta(days=DATA_RETENTION_DAYS)
@@ -938,7 +1018,10 @@ def create_verification_app(bot) -> web.Application:
                 if attempt is None:
                     return _error_response("invalid_or_expired_link", 400)
 
-                if vpn_check.available_count == 0:
+                if (
+                    vpn_check.available_count == 0
+                    and not regional_review_role_ids
+                ):
                     await database.finalize_verification_attempt(
                         attempt["id"],
                         risk_score=0,
@@ -973,6 +1056,10 @@ def create_verification_app(bot) -> web.Application:
                             vpn_check.detected_signal_map()
                         ),
                         vpn_unavailable_by=vpn_check.unavailable_providers,
+                    )
+                    assessment = _force_regional_manual_review(
+                        assessment,
+                        regional_review_role_ids,
                     )
                     logger.info(
                         (
@@ -1040,7 +1127,7 @@ def create_verification_app(bot) -> web.Application:
         if attempt is None:
             return _error_response("temporarily_unavailable", 503)
 
-        if vpn_check.available_count == 0:
+        if vpn_check.available_count == 0 and not regional_review_role_ids:
             await _send_private_result(
                 bot,
                 token_id,
@@ -1073,6 +1160,7 @@ def create_verification_app(bot) -> web.Application:
                     attempt["id"],
                     country_code,
                     vpn_check,
+                    regional_review_role_ids,
                 )
             except Exception:
                 logger.exception(

@@ -7,11 +7,18 @@ try:
     from api.verification_api import (
         RoleGrantError,
         _discord_authorization_url,
+        _force_regional_manual_review,
         _load_oauth_signals,
+        _member_regional_review_role_ids,
         _oauth_result_url,
         _oauth_state_digest,
+        _remove_legacy_verified_role,
     )
-    from modules.verificacion import VerificationManager
+    from core.verification_risk import RiskAssessment
+    from modules.verificacion import (
+        VerificationManager,
+        _attempt_regional_review_role_ids,
+    )
 except ModuleNotFoundError as exc:
     raise unittest.SkipTest(
         f"Dependencia opcional no instalada: {exc.name}"
@@ -67,6 +74,43 @@ class OAuthFlowTests(unittest.TestCase):
 
 
 class RoleDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_role_is_removed_when_present(self):
+        legacy_role = SimpleNamespace(id=1409401827065204786)
+        member = SimpleNamespace(
+            get_role=lambda role_id: (
+                legacy_role if role_id == legacy_role.id else None
+            ),
+            remove_roles=AsyncMock(),
+        )
+
+        removed = await _remove_legacy_verified_role(
+            member,
+            [legacy_role],
+            reason="Prueba de limpieza",
+        )
+
+        self.assertTrue(removed)
+        member.remove_roles.assert_awaited_once_with(
+            legacy_role,
+            reason="Prueba de limpieza",
+        )
+
+    async def test_legacy_role_cleanup_is_noop_when_absent(self):
+        legacy_role = SimpleNamespace(id=1409401827065204786)
+        member = SimpleNamespace(
+            get_role=lambda _role_id: None,
+            remove_roles=AsyncMock(),
+        )
+
+        removed = await _remove_legacy_verified_role(
+            member,
+            [legacy_role],
+            reason="Prueba de limpieza",
+        )
+
+        self.assertFalse(removed)
+        member.remove_roles.assert_not_awaited()
+
     async def test_existing_discord_role_completes_pending_delivery(self):
         row = {
             "id": 42,
@@ -150,6 +194,72 @@ class RoleDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             reschedule.await_args.kwargs["retry_after_seconds"],
             21600,
+        )
+
+
+class RegionalReviewTests(unittest.IsolatedAsyncioTestCase):
+    def test_member_filter_roles_are_detected_and_sorted(self):
+        member = SimpleNamespace(
+            roles=[
+                SimpleNamespace(id=999),
+                SimpleNamespace(id=1328006434847195208),
+                SimpleNamespace(id=1288218486363132008),
+            ]
+        )
+
+        self.assertEqual(
+            _member_regional_review_role_ids(member),
+            (1288218486363132008, 1328006434847195208),
+        )
+
+    def test_regional_role_forces_review_without_inflating_risk(self):
+        assessment = RiskAssessment(
+            score=5,
+            level="low",
+            decision="approved",
+            possible_main_user_id=None,
+            reasons=("Ingreso reciente",),
+            related_user_count=0,
+        )
+
+        forced = _force_regional_manual_review(
+            assessment,
+            (1328006434847195208,),
+        )
+
+        self.assertEqual(forced.decision, "review")
+        self.assertEqual(forced.score, 5)
+        self.assertEqual(forced.level, "low")
+        self.assertIn(
+            "Rol regional sujeto a revisión manual obligatoria",
+            forced.reasons,
+        )
+
+    def test_persisted_filter_roles_survive_json_roundtrip(self):
+        row = {
+            "signals": (
+                '{"regional_review_role_ids":['
+                '"1328006434847195208",999,true]}'
+            )
+        }
+
+        self.assertEqual(
+            _attempt_regional_review_role_ids(row),
+            (1328006434847195208,),
+        )
+
+    async def test_filtered_role_rejection_is_notified_in_portuguese(self):
+        member = SimpleNamespace(id=123, send=AsyncMock())
+        manager = VerificationManager(SimpleNamespace())
+
+        await manager._notify_reviewed_user(
+            member,
+            accepted=False,
+            regional_rejection=True,
+        )
+
+        member.send.assert_awaited_once_with(
+            "Região incorreta. Verificação recusada."
         )
 
 

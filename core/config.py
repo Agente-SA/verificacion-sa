@@ -78,9 +78,14 @@ def _normalize_database_url(raw_url: str) -> str:
 DATABASE_URL = _normalize_database_url(os.getenv("DATABASE_URL", ""))
 
 VERIFIED_ROLE_ID = _env_int("VERIFIED_ROLE_ID")
+LEGACY_VERIFIED_ROLE_ID = 1409401827065204786
 STAFF_CHANNEL_ID = _env_int("STAFF_CHANNEL_ID")
 VERIFICATION_TICKET_CHANNEL_ID = _env_int("VERIFICATION_TICKET_CHANNEL_ID")
 STAFF_ROLE_IDS = _env_snowflake_set("STAFF_ROLE_IDS")
+REGIONAL_REVIEW_ROLE_IDS = frozenset({
+    1288218486363132008,
+    1328006434847195208,
+})
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 TOKEN_EXPIRATION_MINUTES = max(1, _env_int("TOKEN_EXPIRATION_MINUTES", 10))

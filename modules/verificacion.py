@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import math
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from core import database
 from core.config import (
     DB_NO_DISPONIBLE,
     GUILD_ID,
+    REGIONAL_REVIEW_ROLE_IDS,
     STAFF_ROLE_IDS,
     TOKEN_EXPIRATION_MINUTES,
     VERIFICATION_TICKET_CHANNEL_ID,
@@ -24,6 +26,35 @@ logger = logging.getLogger(__name__)
 ISSUE_COOLDOWN_SECONDS = 15
 RESULT_INTERACTION_LIFETIME_SECONDS = TOKEN_EXPIRATION_MINUTES * 60
 VERIFIED_USERS_PER_PAGE = 10
+
+
+def _attempt_regional_review_role_ids(row) -> tuple[int, ...]:
+    try:
+        signals = row["signals"]
+    except (KeyError, TypeError):
+        return ()
+    if isinstance(signals, str):
+        try:
+            signals = json.loads(signals)
+        except json.JSONDecodeError:
+            return ()
+    if not isinstance(signals, dict):
+        return ()
+    raw_role_ids = signals.get("regional_review_role_ids")
+    if not isinstance(raw_role_ids, (list, tuple)):
+        return ()
+
+    role_ids = set()
+    for raw_role_id in raw_role_ids:
+        if isinstance(raw_role_id, bool):
+            continue
+        try:
+            role_id = int(raw_role_id)
+        except (TypeError, ValueError):
+            continue
+        if role_id in REGIONAL_REVIEW_ROLE_IDS:
+            role_ids.add(role_id)
+    return tuple(sorted(role_ids))
 
 
 def _discord_timestamp(value, style: str = "d") -> str:
@@ -568,12 +599,15 @@ class VerificationManager:
         member: discord.Member,
         *,
         accepted: bool,
+        regional_rejection: bool = False,
     ) -> None:
         if accepted:
             content = (
                 "Tu solicitud de Verificación fue aceptada y ya recibiste "
                 f"el rol <@&{VERIFIED_ROLE_ID}>."
             )
+        elif regional_rejection:
+            content = "Região incorreta. Verificação recusada."
         else:
             content = (
                 "Tu solicitud de Verificación fue rechazada. Si crees que se "
@@ -616,6 +650,10 @@ class VerificationManager:
                     ephemeral=True,
                 )
                 return
+
+            regional_review_role_ids = _attempt_regional_review_role_ids(
+                claimed
+            )
 
             member = await self._manual_review_member(claimed)
             if member is None:
@@ -690,7 +728,11 @@ class VerificationManager:
                 )
 
             if not accepted:
-                await self._notify_reviewed_user(member, accepted=False)
+                await self._notify_reviewed_user(
+                    member,
+                    accepted=False,
+                    regional_rejection=bool(regional_review_role_ids),
+                )
             if accepted and delivery_result != "granted":
                 response_text = (
                     "Revisión **aceptada**. La entrega del rol quedó en la "
