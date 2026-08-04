@@ -47,6 +47,18 @@ def _env_ip_networks(name: str, default: str) -> tuple:
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = _env_int("GUILD_ID")
+DISCORD_CLIENT_ID = _env_int("DISCORD_CLIENT_ID")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
+DISCORD_OAUTH_REDIRECT_URI = os.getenv(
+    "DISCORD_OAUTH_REDIRECT_URI",
+    "",
+).strip()
+OAUTH_STATE_EXPIRATION_MINUTES = max(
+    1,
+    min(_env_int("OAUTH_STATE_EXPIRATION_MINUTES", 10), 30),
+)
+
+
 def _normalize_database_url(raw_url: str) -> str:
     database_url = raw_url.strip()
     if database_url.startswith("postgres://"):
@@ -100,6 +112,9 @@ def get_configuration_errors() -> tuple[str, ...]:
     required_values = {
         "DISCORD_TOKEN": DISCORD_TOKEN,
         "GUILD_ID": GUILD_ID,
+        "DISCORD_CLIENT_ID": DISCORD_CLIENT_ID,
+        "DISCORD_CLIENT_SECRET": DISCORD_CLIENT_SECRET,
+        "DISCORD_OAUTH_REDIRECT_URI": DISCORD_OAUTH_REDIRECT_URI,
         "DATABASE_URL": DATABASE_URL,
         "VERIFIED_ROLE_ID": VERIFIED_ROLE_ID,
         "STAFF_CHANNEL_ID": STAFF_CHANNEL_ID,
@@ -114,6 +129,16 @@ def get_configuration_errors() -> tuple[str, ...]:
         parsed_frontend = urlsplit(FRONTEND_URL)
         if parsed_frontend.scheme != "https" or not parsed_frontend.netloc:
             errors.append("FRONTEND_URL debe usar HTTPS")
+    if DISCORD_OAUTH_REDIRECT_URI:
+        parsed_redirect = urlsplit(DISCORD_OAUTH_REDIRECT_URI)
+        if parsed_redirect.scheme != "https" or not parsed_redirect.netloc:
+            errors.append("DISCORD_OAUTH_REDIRECT_URI debe usar HTTPS")
+        if parsed_redirect.fragment or parsed_redirect.query:
+            errors.append(
+                "DISCORD_OAUTH_REDIRECT_URI no debe contener query ni fragmento"
+            )
+    if DISCORD_CLIENT_SECRET and len(DISCORD_CLIENT_SECRET) < 20:
+        errors.append("DISCORD_CLIENT_SECRET parece incompleto")
     if DATABASE_URL and not DATABASE_URL.startswith("postgresql://"):
         errors.append("DATABASE_URL debe ser una URL PostgreSQL")
     if TOKEN_SECRET and len(TOKEN_SECRET) < 32:

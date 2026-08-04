@@ -6,7 +6,12 @@ from discord.ext import commands, tasks
 
 from api.verification_api import VerificationAPIServer
 from core.config import DISCORD_TOKEN, GUILD_ID, intents, validate_configuration
-from core.database import close_db, init_db, purge_expired_verification_data
+from core.database import (
+    close_db,
+    init_db,
+    purge_expired_verification_data,
+    recover_role_deliveries_on_startup,
+)
 from modules import verificacion
 
 
@@ -48,6 +53,12 @@ class VerificationBot(commands.Bot):
     async def setup_hook(self) -> None:
         validate_configuration()
         await init_db()
+        recovered_deliveries = await recover_role_deliveries_on_startup()
+        if recovered_deliveries:
+            print(
+                "Entregas de rol recuperadas: "
+                f"{recovered_deliveries} pendiente(s)."
+            )
 
         verification_manager = verificacion.setup(self)
         restored_reviews = (
@@ -60,6 +71,7 @@ class VerificationBot(commands.Bot):
         self.verification_api = VerificationAPIServer(self)
         await self.verification_api.start()
         self.cleanup_verification_data_task.start()
+        self.reconcile_verification_roles_task.start()
 
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
@@ -69,6 +81,8 @@ class VerificationBot(commands.Bot):
     async def close(self) -> None:
         if self.cleanup_verification_data_task.is_running():
             self.cleanup_verification_data_task.cancel()
+        if self.reconcile_verification_roles_task.is_running():
+            self.reconcile_verification_roles_task.cancel()
         if self.verification_api is not None:
             await self.verification_api.stop()
         await close_db()
@@ -84,6 +98,7 @@ class VerificationBot(commands.Bot):
         if any(deleted.values()):
             print(
                 "Retención aplicada: "
+                f"{deleted['oauth']} sesión(es) OAuth, "
                 f"{deleted['attempts']} intento(s), "
                 f"{deleted['tokens']} token(s) y "
                 f"{deleted['antifraud']} señal(es) eliminados."
@@ -93,6 +108,29 @@ class VerificationBot(commands.Bot):
     async def before_verification_cleanup(self) -> None:
         await self.wait_until_ready()
         await asyncio.sleep(30)
+
+    @tasks.loop(seconds=60)
+    async def reconcile_verification_roles_task(self) -> None:
+        manager = getattr(self, "verification_manager", None)
+        if manager is None:
+            return
+        try:
+            processed = await manager.reconcile_pending_role_deliveries()
+        except Exception:
+            logger.exception(
+                "No se pudo reconciliar la entrega de roles de verificación."
+            )
+            return
+        if processed:
+            logger.info(
+                "Reconciliación de roles completada: %s entrega(s) procesada(s).",
+                processed,
+            )
+
+    @reconcile_verification_roles_task.before_loop
+    async def before_role_reconciliation(self) -> None:
+        await self.wait_until_ready()
+        await asyncio.sleep(5)
 
 
 bot = VerificationBot()

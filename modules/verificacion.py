@@ -401,6 +401,152 @@ class VerificationManager:
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
 
+    async def _notify_completed_role_delivery(
+        self,
+        row,
+        member: discord.Member,
+    ) -> None:
+        from api.verification_api import (
+            _send_private_result,
+            _send_success_alert,
+        )
+
+        if row["user_notified_at"] is None:
+            delivered = await _send_private_result(
+                self.bot,
+                row["token_id"],
+                int(row["user_id"]),
+                "approved",
+            )
+            if not delivered:
+                try:
+                    await member.send(
+                        "Tu cuenta ha sido Verificada con Éxito ✅"
+                    )
+                    delivered = True
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.info(
+                        "No se pudo avisar la aprobación al usuario %s.",
+                        member.id,
+                    )
+            await database.mark_role_notification(row["id"], "user")
+
+        if row["staff_notified_at"] is None:
+            try:
+                await _send_success_alert(self.bot, member)
+            except Exception:
+                logger.exception(
+                    "No se pudo notificar al staff la aprobación %s.",
+                    row["id"],
+                )
+            else:
+                await database.mark_role_notification(row["id"], "staff")
+
+    async def process_pending_role_delivery(
+        self,
+        attempt_id: int | None = None,
+    ) -> str | None:
+        row = await database.claim_pending_role_delivery(attempt_id)
+        if row is None:
+            return None
+
+        member = await self._manual_review_member(row)
+        if member is None:
+            await database.reschedule_role_delivery(
+                row["id"],
+                "El usuario no está disponible dentro del servidor.",
+                retry_after_seconds=21600,
+                permanent=True,
+            )
+            logger.warning(
+                "Entrega de rol %s aplazada: usuario %s no disponible.",
+                row["id"],
+                row["user_id"],
+            )
+            return "pending"
+
+        from api.verification_api import (
+            RoleGrantError,
+            _grant_verified_role,
+            _send_role_error_alert,
+        )
+
+        try:
+            await _grant_verified_role(
+                member,
+                reason=(
+                    "Verificacion SA aprobada; entrega durable "
+                    f"{row['id']}"
+                ),
+            )
+        except (RoleGrantError, discord.HTTPException) as exc:
+            cause = exc.__cause__
+            permanent = isinstance(cause, discord.Forbidden)
+            if isinstance(exc, RoleGrantError) and cause is None:
+                permanent = True
+            attempts = max(1, int(row["role_attempts"]))
+            retry_seconds = (
+                21600
+                if permanent
+                else min(1800, 30 * (2 ** min(attempts - 1, 6)))
+            )
+            failed = await database.reschedule_role_delivery(
+                row["id"],
+                exc,
+                retry_after_seconds=retry_seconds,
+                permanent=permanent,
+            )
+            logger.exception(
+                "No se pudo completar la entrega durable del rol %s.",
+                row["id"],
+            )
+            if failed is not None and failed["role_error_notified_at"] is None:
+                try:
+                    await _send_role_error_alert(
+                        self.bot,
+                        member,
+                        int(row["id"]),
+                        str(exc),
+                        getattr(exc, "diagnostics", None),
+                    )
+                except Exception:
+                    logger.exception(
+                        "No se pudo alertar el error de entrega %s.",
+                        row["id"],
+                    )
+                else:
+                    await database.mark_role_notification(row["id"], "error")
+            return "pending"
+
+        completed = await database.complete_role_delivery(row["id"])
+        if completed is None:
+            logger.warning(
+                "La entrega de rol %s cambió de estado antes de finalizar.",
+                row["id"],
+            )
+            return "pending"
+
+        await self._notify_completed_role_delivery(completed, member)
+        return "granted"
+
+    async def reconcile_pending_role_deliveries(self, limit: int = 25) -> int:
+        processed = 0
+        for _ in range(max(1, min(limit, 100))):
+            result = await self.process_pending_role_delivery()
+            if result is None:
+                break
+            processed += 1
+
+        unnotified = await database.get_unnotified_approved_role_deliveries(
+            limit=limit
+        )
+        for row in unnotified:
+            member = await self._manual_review_member(row)
+            if member is None:
+                continue
+            await self._notify_completed_role_delivery(row, member)
+        return processed
+
     async def _release_manual_review(
         self,
         attempt_id: int,
@@ -483,37 +629,6 @@ class VerificationManager:
                 )
                 return
 
-            role_added = False
-            if accepted:
-                from api.verification_api import (
-                    RoleGrantError,
-                    _grant_verified_role,
-                    _remove_verified_role,
-                )
-
-                try:
-                    role_added = await _grant_verified_role(
-                        member,
-                        reason=(
-                            "Verificacion SA aprobada manualmente por staff "
-                            f"{interaction.user.id}"
-                        ),
-                    )
-                except (RoleGrantError, discord.HTTPException) as exc:
-                    await self._release_manual_review(
-                        attempt_id,
-                        interaction.user.id,
-                    )
-                    logger.exception(
-                        "No se pudo otorgar el rol en la revisión %s.",
-                        attempt_id,
-                    )
-                    await interaction.followup.send(
-                        f"No fue posible otorgar el rol: {str(exc)[:300]}",
-                        ephemeral=True,
-                    )
-                    return
-
             try:
                 completed = await database.complete_manual_review(
                     attempt_id,
@@ -523,14 +638,6 @@ class VerificationManager:
                 if completed is None:
                     raise RuntimeError("La revisión dejó de estar disponible.")
             except Exception:
-                if accepted and role_added:
-                    try:
-                        await _remove_verified_role(member)
-                    except discord.HTTPException:
-                        logger.exception(
-                            "No se pudo revertir el rol de la revisión %s.",
-                            attempt_id,
-                        )
                 await self._release_manual_review(
                     attempt_id,
                     interaction.user.id,
@@ -541,6 +648,18 @@ class VerificationManager:
                     ephemeral=True,
                 )
                 return
+
+            delivery_result = None
+            if accepted:
+                try:
+                    delivery_result = await self.process_pending_role_delivery(
+                        attempt_id
+                    )
+                except Exception:
+                    logger.exception(
+                        "La revisión %s fue aceptada, pero el rol quedó pendiente.",
+                        attempt_id,
+                    )
 
             result = "ACEPTADA" if accepted else "RECHAZADA"
             embed = (
@@ -570,9 +689,19 @@ class VerificationManager:
                     attempt_id,
                 )
 
-            await self._notify_reviewed_user(member, accepted=accepted)
+            if not accepted:
+                await self._notify_reviewed_user(member, accepted=False)
+            if accepted and delivery_result != "granted":
+                response_text = (
+                    "Revisión **aceptada**. La entrega del rol quedó en la "
+                    "cola automática de reintentos."
+                )
+            else:
+                response_text = (
+                    f"Revisión **{result.lower()}** correctamente."
+                )
             await interaction.followup.send(
-                f"Revisión **{result.lower()}** correctamente.",
+                response_text,
                 ephemeral=True,
             )
             self._manual_review_locks.pop(attempt_id, None)

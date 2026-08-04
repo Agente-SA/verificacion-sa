@@ -8,6 +8,15 @@
   const startButton = document.getElementById("start-verification");
   const linkWarning = document.getElementById("link-warning");
   const statusMessage = document.getElementById("status-message");
+  const successTitle = document.getElementById("success-title");
+  const resultMessage = document.getElementById("result-message");
+  const resultNote = document.getElementById("result-note");
+
+  const oauthResult = readFragmentValue("result");
+  if (["received", "rejected", "retry"].includes(oauthResult)) {
+    showOAuthResult(oauthResult);
+    return;
+  }
 
   const token = readToken();
   const tokenIsValid = /^[A-Za-z0-9._~-]{20,2048}$/.test(token);
@@ -24,10 +33,33 @@
   startButton.addEventListener("click", submitVerification);
 
   function readToken() {
+    return readFragmentValue("token");
+  }
+
+  function readFragmentValue(name) {
     const fragment = window.location.hash.startsWith("#")
       ? window.location.hash.slice(1)
       : window.location.hash;
-    return new URLSearchParams(fragment).get("token") || "";
+    return new URLSearchParams(fragment).get(name) || "";
+  }
+
+  function showOAuthResult(result) {
+    window.history.replaceState(null, "", window.location.pathname);
+    verificationPanel.classList.add("is-hidden");
+    successPanel.classList.remove("is-hidden");
+
+    if (result === "rejected") {
+      successTitle.textContent = "Verificación no aprobada";
+      resultMessage.textContent =
+        "Vuelve a Discord para consultar el resultado y las opciones de soporte.";
+      resultNote.textContent = "Ya puedes cerrar esta página.";
+    } else if (result === "retry") {
+      successTitle.textContent = "No pudimos completar la solicitud";
+      resultMessage.textContent =
+        "Regresa a Discord, genera un enlace nuevo e inténtalo más tarde.";
+      resultNote.textContent = "Ningún acceso fue concedido.";
+    }
+    successPanel.focus?.();
   }
 
   function collectLimitedSignals() {
@@ -77,7 +109,7 @@
     );
 
     try {
-      const response = await fetch(`${apiBaseUrl}/api/verification/submit`, {
+      const response = await fetch(`${apiBaseUrl}/api/oauth/start`, {
         method: "POST",
         mode: "cors",
         credentials: "omit",
@@ -96,11 +128,18 @@
       });
 
       if (!response.ok) throw new Error("verification_request_failed");
+      const result = await response.json();
+
+      if (result.status === "completed" && isSafeResultUrl(result.result_url)) {
+        window.location.replace(result.result_url);
+        return;
+      }
+      if (!isDiscordAuthorizationUrl(result.authorization_url)) {
+        throw new Error("invalid_oauth_authorization_url");
+      }
 
       window.history.replaceState(null, "", window.location.pathname);
-      verificationPanel.classList.add("is-hidden");
-      successPanel.classList.remove("is-hidden");
-      successPanel.focus?.();
+      window.location.assign(result.authorization_url);
     } catch (error) {
       showStatus(
         "No pudimos completar la solicitud en este momento. Regresa a Discord, " +
@@ -112,11 +151,33 @@
     }
   }
 
+  function isDiscordAuthorizationUrl(value) {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" &&
+        url.hostname === "discord.com" &&
+        url.pathname === "/oauth2/authorize";
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function isSafeResultUrl(value) {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" &&
+        url.origin === window.location.origin &&
+        url.hash.startsWith("#result=");
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function setLoading(isLoading) {
     startButton.disabled = isLoading || !consentInput.checked;
     consentInput.disabled = isLoading;
     startButton.lastChild.textContent = isLoading
-      ? " Procesando..."
+      ? " Conectando con Discord..."
       : " Iniciar verificación";
   }
 

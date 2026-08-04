@@ -1,21 +1,28 @@
+import hashlib
 import ipaddress
 import json
 import logging
 import re
+import secrets
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
+from uuid import uuid4
 
 import discord
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 
 from core import database
 from core.config import (
     API_HOST,
     API_PORT,
     DATA_RETENTION_DAYS,
+    DISCORD_CLIENT_ID,
+    DISCORD_CLIENT_SECRET,
+    DISCORD_OAUTH_REDIRECT_URI,
     FRONTEND_URL,
     GUILD_ID,
     IP_HASH_SECRET_VERSION,
+    OAUTH_STATE_EXPIRATION_MINUTES,
     STAFF_CHANNEL_ID,
     STAFF_ROLE_IDS,
     TRUSTED_PROXY_NETWORKS,
@@ -39,7 +46,7 @@ from core.vpn_detection import VPNCheckResult, check_vpn_services
 
 logger = logging.getLogger(__name__)
 API_NAME = "verification-sa-api"
-API_VERSION = 2
+API_VERSION = 3
 MAX_REQUEST_SIZE = 64 * 1024
 RATE_WINDOW = timedelta(minutes=15)
 USER_SUBMISSION_LIMIT = 5
@@ -57,6 +64,11 @@ SIGNAL_KEYS = frozenset({
 })
 DEVICE_CLASSES = frozenset({"phone", "tablet", "desktop"})
 COUNTRY_CODE_PATTERN = re.compile(r"^[A-Z0-9]{2}$")
+OAUTH_STATE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,128}$")
+DISCORD_AUTHORIZE_URL = "https://discord.com/oauth2/authorize"
+DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
+DISCORD_CURRENT_USER_URL = "https://discord.com/api/v10/users/@me"
+OAUTH_HTTP_TIMEOUT = ClientTimeout(total=15)
 
 
 class InvalidSubmission(ValueError):
@@ -91,6 +103,83 @@ def _error_response(code: str, status: int) -> web.Response:
         {"status": "error", "code": code},
         status=status,
     )
+
+
+def _oauth_state_digest(state: str) -> str:
+    return hashlib.sha256(state.encode("ascii")).hexdigest()
+
+
+def _discord_authorization_url(state: str) -> str:
+    query = urlencode(
+        {
+            "client_id": str(DISCORD_CLIENT_ID),
+            "response_type": "code",
+            "redirect_uri": DISCORD_OAUTH_REDIRECT_URI,
+            "scope": "identify",
+            "state": state,
+        }
+    )
+    return f"{DISCORD_AUTHORIZE_URL}?{query}"
+
+
+def _oauth_result_url(result: str) -> str:
+    safe_result = result if result in {
+        "received",
+        "rejected",
+        "retry",
+    } else "retry"
+    return f"{FRONTEND_URL}/#result={safe_result}"
+
+
+def _oauth_redirect(result: str) -> web.HTTPFound:
+    return web.HTTPFound(location=_oauth_result_url(result))
+
+
+async def _exchange_oauth_identity(code: str) -> int:
+    token_payload = {
+        "client_id": str(DISCORD_CLIENT_ID),
+        "client_secret": DISCORD_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": DISCORD_OAUTH_REDIRECT_URI,
+    }
+    async with ClientSession(timeout=OAUTH_HTTP_TIMEOUT) as session:
+        async with session.post(
+            DISCORD_TOKEN_URL,
+            data=token_payload,
+            headers={"Accept": "application/json"},
+        ) as response:
+            if response.status != 200:
+                body = await response.text()
+                raise RuntimeError(
+                    f"Discord rechazo el codigo OAuth ({response.status}): "
+                    f"{body[:200]}"
+                )
+            token_data = await response.json()
+
+        access_token = token_data.get("access_token")
+        token_type = token_data.get("token_type", "Bearer")
+        if not isinstance(access_token, str) or not access_token:
+            raise RuntimeError("Discord no devolvio un access token OAuth.")
+
+        async with session.get(
+            DISCORD_CURRENT_USER_URL,
+            headers={
+                "Authorization": f"{token_type} {access_token}",
+                "Accept": "application/json",
+            },
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    "Discord no permitio consultar la identidad OAuth "
+                    f"({response.status})."
+                )
+            identity = await response.json()
+
+    user_id = identity.get("id")
+    if not isinstance(user_id, str) or not user_id.isdigit():
+        raise RuntimeError("Discord devolvio una identidad OAuth invalida.")
+    return int(user_id)
 
 
 def _safe_string(signals: dict, key: str, max_length: int) -> str:
@@ -142,6 +231,17 @@ def _parse_submission(payload: object) -> tuple[str, dict]:
         "touch_support": signals["touchSupport"],
     }
     return token, sanitized
+
+
+def _load_oauth_signals(value: object) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise InvalidSubmission("Senales OAuth invalidas.") from exc
+    if not isinstance(value, dict):
+        raise InvalidSubmission("Senales OAuth invalidas.")
+    return value
 
 
 def _browser_family(user_agent: str) -> str:
@@ -354,14 +454,14 @@ async def _send_private_result(
     token_id,
     user_id: int,
     outcome: str,
-) -> None:
+) -> bool:
     manager = getattr(bot, "verification_manager", None)
     if manager is None:
         logger.warning(
             "No hay gestor disponible para notificar la verificacion de %s.",
             user_id,
         )
-        return
+        return False
 
     try:
         delivered = await manager.send_verification_result(
@@ -374,13 +474,47 @@ async def _send_private_result(
             "No se pudo enviar el resultado privado de verificacion a %s.",
             user_id,
         )
-        return
+        return False
 
     if not delivered:
         logger.info(
             "La interaccion privada de verificacion ya no estaba activa para %s.",
             user_id,
         )
+    return delivered
+
+
+async def _send_identity_mismatch_alert(
+    bot,
+    expected_user_id: int,
+    oauth_user_id: int,
+) -> None:
+    channel = await _staff_channel(bot)
+    if channel is None:
+        return
+    embed = discord.Embed(
+        title="Identidad OAuth2 no coincidente",
+        description=(
+            "El enlace personal fue abierto con una cuenta de Discord "
+            "diferente. La solicitud fue invalidada."
+        ),
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Usuario esperado",
+        value=f"<@{expected_user_id}> (`{expected_user_id}`)",
+        inline=True,
+    )
+    embed.add_field(
+        name="Identidad autenticada",
+        value=f"<@{oauth_user_id}> (`{oauth_user_id}`)",
+        inline=True,
+    )
+    await channel.send(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 async def _send_review_alert(
@@ -672,53 +806,47 @@ def create_verification_app(bot) -> web.Application:
             }
         )
 
-    async def submit(request: web.Request) -> web.Response:
+    async def _evaluate_authenticated_submission(
+        request: web.Request,
+        oauth_session,
+    ) -> web.Response:
         if database.bot_pool is None or not bot.is_ready():
             return _error_response("temporarily_unavailable", 503)
-        if request.content_type != "application/json":
-            return _error_response("invalid_request", 415)
 
         try:
-            request_payload = await request.json(loads=json.loads)
-            supplied_token, signals = _parse_submission(request_payload)
-            verification_token = validate_signed_verification_token(
-                supplied_token,
-                expected_guild_id=configured_guild_id,
-            )
-        except (json.JSONDecodeError, InvalidSubmission):
+            signals = _load_oauth_signals(oauth_session["signals"])
+        except InvalidSubmission:
             return _error_response("invalid_request", 400)
-        except InvalidVerificationToken:
-            return _error_response("invalid_or_expired_link", 400)
-        except VerificationConfigurationError:
-            logger.exception("Configuracion criptografica de verificacion invalida.")
-            return _error_response("temporarily_unavailable", 503)
+        token_id = oauth_session["token_id"]
+        guild_id = int(oauth_session["guild_id"])
+        user_id = int(oauth_session["expected_user_id"])
+        supplied_digest = str(oauth_session["token_digest"])
 
         try:
             member = await _get_member(
                 bot,
-                verification_token.guild_id,
-                verification_token.user_id,
+                guild_id,
+                user_id,
             )
         except discord.HTTPException:
             logger.exception(
                 "No se pudo comprobar el miembro de verificacion %s.",
-                verification_token.user_id,
+                user_id,
             )
             return _error_response("temporarily_unavailable", 503)
 
         if member is None or member.bot:
             return _error_response("membership_required", 403)
 
-        supplied_digest = token_digest(supplied_token)
         if member.get_role(VERIFIED_ROLE_ID) is not None:
             await database.revoke_verification_token(
-                verification_token.token_id,
+                token_id,
                 supplied_digest,
             )
             await _send_private_result(
                 bot,
-                verification_token.token_id,
-                verification_token.user_id,
+                token_id,
+                user_id,
                 "approved",
             )
             return web.json_response({"status": "completed"})
@@ -754,8 +882,6 @@ def create_verification_app(bot) -> web.Application:
         vpn_check = await check_vpn_services(client_ip)
         attempt = None
         assessment = None
-        role_added = False
-        role_error = None
         try:
             async with database.verification_signal_transaction(
                 ip_hash,
@@ -763,8 +889,8 @@ def create_verification_app(bot) -> web.Application:
             ) as conn:
                 user_count, ip_count = (
                     await database.get_verification_submission_counts(
-                        verification_token.guild_id,
-                        verification_token.user_id,
+                        guild_id,
+                        user_id,
                         ip_hashes,
                         current_time - RATE_WINDOW,
                         conn=conn,
@@ -777,10 +903,10 @@ def create_verification_app(bot) -> web.Application:
                     return _error_response("too_many_requests", 429)
 
                 attempt = await database.record_pending_verification_attempt(
-                    token_id=verification_token.token_id,
+                    token_id=token_id,
                     token_digest=supplied_digest,
-                    guild_id=verification_token.guild_id,
-                    user_id=verification_token.user_id,
+                    guild_id=guild_id,
+                    user_id=user_id,
                     discord_tag=str(member)[:128],
                     ip_hash=ip_hash,
                     ip_network_hash=ip_network_hash,
@@ -828,8 +954,8 @@ def create_verification_app(bot) -> web.Application:
                 else:
                     candidates = (
                         await database.get_verification_match_candidates(
-                            verification_token.guild_id,
-                            verification_token.user_id,
+                            guild_id,
+                            user_id,
                             ip_hashes,
                             ip_network_hashes,
                             fingerprint_hashes,
@@ -851,7 +977,7 @@ def create_verification_app(bot) -> web.Application:
                             "decision=%s | riesgo=%s/100 | relacionadas=%s | "
                             "vpn=%s | motivos=%s"
                         ),
-                        verification_token.user_id,
+                        user_id,
                         attempt["id"],
                         assessment.decision,
                         assessment.score,
@@ -889,52 +1015,23 @@ def create_verification_app(bot) -> web.Application:
                             conn=conn,
                         )
                     else:
-                        try:
-                            role_added = await _grant_verified_role(member)
-                        except (RoleGrantError, discord.HTTPException) as exc:
-                            role_error = exc
-                            await database.finalize_verification_attempt(
-                                attempt["id"],
-                                risk_score=assessment.score,
-                                risk_level=assessment.level,
-                                decision="error",
-                                role_granted=False,
-                                possible_main_user_id=None,
-                                risk_reasons=[
-                                    "No fue posible otorgar el rol verificado"
-                                ],
-                                conn=conn,
+                        queued = await database.queue_approved_role_delivery(
+                            attempt["id"],
+                            risk_score=assessment.score,
+                            risk_level=assessment.level,
+                            possible_main_user_id=None,
+                            risk_reasons=list(assessment.reasons),
+                            conn=conn,
+                        )
+                        if queued is None:
+                            raise RuntimeError(
+                                "La verificacion pendiente ya no existe."
                             )
-                        else:
-                            finalized = (
-                                await database.finalize_verification_attempt(
-                                    attempt["id"],
-                                    risk_score=assessment.score,
-                                    risk_level=assessment.level,
-                                    decision="approved",
-                                    role_granted=True,
-                                    possible_main_user_id=None,
-                                    risk_reasons=list(assessment.reasons),
-                                    conn=conn,
-                                )
-                            )
-                            if finalized is None:
-                                raise RuntimeError(
-                                    "La verificacion pendiente ya no existe."
-                                )
         except Exception:
             logger.exception(
                 "No se pudo evaluar o finalizar la solicitud del usuario %s.",
-                verification_token.user_id,
+                user_id,
             )
-            if role_added:
-                try:
-                    await _remove_verified_role(member)
-                except discord.HTTPException:
-                    logger.exception(
-                        "No se pudo revertir el rol del usuario %s.",
-                        member.id,
-                    )
             return _error_response("temporarily_unavailable", 503)
 
         if attempt is None:
@@ -943,8 +1040,8 @@ def create_verification_app(bot) -> web.Application:
         if vpn_check.available_count == 0:
             await _send_private_result(
                 bot,
-                verification_token.token_id,
-                verification_token.user_id,
+                token_id,
+                user_id,
                 "retry",
             )
             try:
@@ -959,33 +1056,6 @@ def create_verification_app(bot) -> web.Application:
                     "No se pudo notificar la indisponibilidad VPN %s.",
                     attempt["id"],
                 )
-            return _error_response("temporarily_unavailable", 503)
-
-        if role_error is not None:
-            logger.error(
-                "No se pudo otorgar el rol de verificacion al usuario %s.",
-                member.id,
-                exc_info=role_error,
-            )
-            try:
-                await _send_role_error_alert(
-                    bot,
-                    member,
-                    attempt["id"],
-                    str(role_error),
-                    getattr(role_error, "diagnostics", None),
-                )
-            except Exception:
-                logger.exception(
-                    "No se pudo enviar la alerta del error de rol %s.",
-                    attempt["id"],
-                )
-            await _send_private_result(
-                bot,
-                verification_token.token_id,
-                verification_token.user_id,
-                "retry",
-            )
             return _error_response("temporarily_unavailable", 503)
 
         if assessment is None:
@@ -1028,16 +1098,16 @@ def create_verification_app(bot) -> web.Application:
                     )
                 await _send_private_result(
                     bot,
-                    verification_token.token_id,
-                    verification_token.user_id,
+                    token_id,
+                    user_id,
                     "retry",
                 )
                 return _error_response("temporarily_unavailable", 503)
 
             await _send_private_result(
                 bot,
-                verification_token.token_id,
-                verification_token.user_id,
+                token_id,
+                user_id,
                 "review",
             )
             return web.json_response({"status": "review"}, status=202)
@@ -1045,8 +1115,8 @@ def create_verification_app(bot) -> web.Application:
         if assessment.is_rejected:
             await _send_private_result(
                 bot,
-                verification_token.token_id,
-                verification_token.user_id,
+                token_id,
+                user_id,
                 "rejected",
             )
             try:
@@ -1065,20 +1135,209 @@ def create_verification_app(bot) -> web.Application:
                 )
             return web.json_response({"status": "rejected"}, status=202)
 
-        await _send_private_result(
-            bot,
-            verification_token.token_id,
-            verification_token.user_id,
-            "approved",
-        )
+        manager = getattr(bot, "verification_manager", None)
+        if manager is not None:
+            try:
+                await manager.process_pending_role_delivery(attempt["id"])
+            except Exception:
+                logger.exception(
+                    "La entrega inmediata del rol %s quedo pendiente.",
+                    attempt["id"],
+                )
+        return web.json_response({"status": "received"}, status=202)
+
+    async def start_oauth(request: web.Request) -> web.Response:
+        if database.bot_pool is None or not bot.is_ready():
+            return _error_response("temporarily_unavailable", 503)
+        if request.content_type != "application/json":
+            return _error_response("invalid_request", 415)
+
         try:
-            await _send_success_alert(bot, member)
+            request_payload = await request.json(loads=json.loads)
+            supplied_token, signals = _parse_submission(request_payload)
+            verification_token = validate_signed_verification_token(
+                supplied_token,
+                expected_guild_id=configured_guild_id,
+            )
+            client_ip = _client_ip(request)
+            ip_hash = hash_ip_address(client_ip)
+            ip_hashes = hash_ip_address_candidates(client_ip)
+            ip_network_hash = hash_ip_network(client_ip)
+        except (json.JSONDecodeError, InvalidSubmission):
+            return _error_response("invalid_request", 400)
+        except InvalidVerificationToken:
+            return _error_response("invalid_or_expired_link", 400)
+        except VerificationConfigurationError:
+            logger.exception("Configuracion criptografica de verificacion invalida.")
+            return _error_response("temporarily_unavailable", 503)
+
+        try:
+            member = await _get_member(
+                bot,
+                verification_token.guild_id,
+                verification_token.user_id,
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "No se pudo comprobar el miembro OAuth %s.",
+                verification_token.user_id,
+            )
+            return _error_response("temporarily_unavailable", 503)
+        if member is None or member.bot:
+            return _error_response("membership_required", 403)
+
+        supplied_digest = token_digest(supplied_token)
+        if member.get_role(VERIFIED_ROLE_ID) is not None:
+            await database.revoke_verification_token(
+                verification_token.token_id,
+                supplied_digest,
+            )
+            await _send_private_result(
+                bot,
+                verification_token.token_id,
+                verification_token.user_id,
+                "approved",
+            )
+            return web.json_response(
+                {
+                    "status": "completed",
+                    "result_url": _oauth_result_url("received"),
+                }
+            )
+
+        current_time = datetime.now(timezone.utc)
+        try:
+            user_count, ip_count = await database.get_oauth_start_counts(
+                verification_token.guild_id,
+                verification_token.user_id,
+                ip_hashes,
+                current_time - RATE_WINDOW,
+            )
+            if (
+                user_count >= USER_SUBMISSION_LIMIT
+                or ip_count >= IP_SUBMISSION_LIMIT
+            ):
+                return _error_response("too_many_requests", 429)
+
+            state = secrets.token_urlsafe(32)
+            oauth_session = await database.create_oauth_session(
+                session_id=uuid4(),
+                state_digest=_oauth_state_digest(state),
+                token_id=verification_token.token_id,
+                token_digest=supplied_digest,
+                guild_id=verification_token.guild_id,
+                expected_user_id=verification_token.user_id,
+                signals=signals,
+                initial_ip_hash=ip_hash,
+                initial_ip_network_hash=ip_network_hash,
+                hash_key_version=IP_HASH_SECRET_VERSION,
+                expires_at=(
+                    current_time
+                    + timedelta(minutes=OAUTH_STATE_EXPIRATION_MINUTES)
+                ),
+            )
         except Exception:
             logger.exception(
-                "No se pudo enviar el aviso de verificacion exitosa %s.",
-                attempt["id"],
+                "No se pudo crear la sesion OAuth del usuario %s.",
+                verification_token.user_id,
             )
-        return web.json_response({"status": "approved"}, status=202)
+            return _error_response("temporarily_unavailable", 503)
+        if oauth_session is None:
+            return _error_response("invalid_or_expired_link", 400)
+
+        return web.json_response(
+            {
+                "status": "oauth_required",
+                "authorization_url": _discord_authorization_url(state),
+            }
+        )
+
+    async def oauth_callback(request: web.Request) -> web.Response:
+        if database.bot_pool is None or not bot.is_ready():
+            raise _oauth_redirect("retry")
+
+        state = request.query.get("state", "")
+        if not OAUTH_STATE_PATTERN.fullmatch(state):
+            raise _oauth_redirect("retry")
+
+        oauth_session = await database.claim_oauth_session(
+            _oauth_state_digest(state)
+        )
+        if oauth_session is None:
+            raise _oauth_redirect("retry")
+
+        oauth_user_id = None
+        try:
+            code = request.query.get("code", "")
+            oauth_error = request.query.get("error")
+            if oauth_error or not code or len(code) > 2048:
+                raise RuntimeError("La autorizacion OAuth fue cancelada o es invalida.")
+
+            oauth_user_id = await _exchange_oauth_identity(code)
+            expected_user_id = int(oauth_session["expected_user_id"])
+            if oauth_user_id != expected_user_id:
+                await database.revoke_verification_token(
+                    oauth_session["token_id"],
+                    str(oauth_session["token_digest"]),
+                )
+                await database.complete_oauth_session(
+                    oauth_session["session_id"],
+                    "identity_mismatch",
+                    oauth_user_id=oauth_user_id,
+                    last_error="La identidad OAuth no coincide con el enlace.",
+                )
+                await _send_private_result(
+                    bot,
+                    oauth_session["token_id"],
+                    expected_user_id,
+                    "rejected",
+                )
+                try:
+                    await _send_identity_mismatch_alert(
+                        bot,
+                        expected_user_id,
+                        oauth_user_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "No se pudo alertar la identidad OAuth no coincidente."
+                    )
+                raise _oauth_redirect("rejected")
+
+            response = await _evaluate_authenticated_submission(
+                request,
+                oauth_session,
+            )
+            if response.status < 400:
+                await database.complete_oauth_session(
+                    oauth_session["session_id"],
+                    "completed",
+                    oauth_user_id=oauth_user_id,
+                )
+                raise _oauth_redirect("received")
+
+            await database.complete_oauth_session(
+                oauth_session["session_id"],
+                "error",
+                oauth_user_id=oauth_user_id,
+                last_error=f"La evaluacion termino con HTTP {response.status}.",
+            )
+            result = "rejected" if response.status == 403 else "retry"
+            raise _oauth_redirect(result)
+        except web.HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("No se pudo completar el callback OAuth2.")
+            try:
+                await database.complete_oauth_session(
+                    oauth_session["session_id"],
+                    "error",
+                    oauth_user_id=oauth_user_id,
+                    last_error=str(exc),
+                )
+            except Exception:
+                logger.exception("No se pudo cerrar la sesion OAuth con error.")
+            raise _oauth_redirect("retry")
 
     async def options(_request: web.Request) -> web.Response:
         return web.Response(status=204)
@@ -1088,7 +1347,8 @@ def create_verification_app(bot) -> web.Application:
         client_max_size=MAX_REQUEST_SIZE,
     )
     app.router.add_get("/health", health)
-    app.router.add_post("/api/verification/submit", submit)
+    app.router.add_post("/api/oauth/start", start_oauth)
+    app.router.add_get("/oauth/callback", oauth_callback)
     app.router.add_route("OPTIONS", "/{path:.*}", options)
     return app
 

@@ -7,7 +7,7 @@ verificacion y el frontend estatico publicado mediante GitHub Pages.
 
 - `bot.py`: arranque del bot, sincronizacion de comandos y ciclo de retencion.
 - `modules/verificacion.py`: panel, enlaces personales y comandos de staff.
-- `api/verification_api.py`: endpoint publico consumido por el frontend.
+- `api/verification_api.py`: OAuth2 `identify`, callback y evaluación pública.
 - `core/database.py`: tablas y consultas exclusivas de verificacion en Neon.
 - `core/verification_security.py`: tokens HMAC y hashes de privacidad.
 - `core/verification_risk.py`: evaluacion de coincidencias y riesgo.
@@ -60,6 +60,19 @@ No reutilices `TOKEN_SECRET`. Los hashes de red admiten una rotacion gradual:
 4. Retira la clave anterior cuando haya expirado la retencion historica que
    fue creada con ella.
 
+### OAuth2 de Discord
+
+La identidad se confirma mediante Authorization Code Grant con el scope mínimo
+`identify`. En Discord Developer Portal agrega en **OAuth2 > Redirects** el
+valor exacto configurado en `DISCORD_OAUTH_REDIRECT_URI`. `DISCORD_CLIENT_ID`
+es el Application ID de Guardian SUS y `DISCORD_CLIENT_SECRET` se obtiene en
+**OAuth2 > Client information** mediante **Reset Secret**. El secreto solo debe
+existir en Square Cloud; nunca debe aparecer en GitHub Pages ni en el repo.
+
+El parámetro `state` se guarda en PostgreSQL mediante hash, caduca y solo puede
+consumirse una vez. Los access tokens OAuth de Discord se descartan después de
+consultar `/users/@me` y no se persisten.
+
 `TRUSTED_PROXY_CIDRS` limita quien puede aportar `CF-Connecting-IP` y
 `CF-IPCountry`. El valor de ejemplo admite loopback y redes privadas usadas
 normalmente entre el proxy y la aplicacion. Si Square Cloud cambia esa ruta,
@@ -75,8 +88,11 @@ debe usar `0.0.0.0/0` ni `::/0`.
 - Si ambos proveedores VPN fallan, no se decide y se solicita otro intento.
 
 Las revisiones conservan botones de Aceptar y Rechazar despues de reinicios.
-Solo la aceptacion otorga el rol. `/metricas` consulta los resultados del mes
-UTC que aun se encuentran dentro de la retencion detallada.
+La aceptacion crea una entrega durable `approved_pending_role`; la aprobación
+solo se completa cuando Discord confirma el rol. Un reconciliador se ejecuta
+al arrancar y cada minuto para recuperar interrupciones. `/metricas` consulta
+los resultados del mes UTC que aun se encuentran dentro de la retencion
+detallada.
 
 ## Desarrollo local
 
@@ -102,9 +118,11 @@ La URL publica de Square Cloud se configura en `assets/js/config.js`.
 3. Asigna al menos 512 MB y el entorno Python recomendado.
 4. Inyecta todas las variables de `.env.example`.
 5. Activa Publicacion en la Web y asigna un subdominio.
-6. Conserva `HOST=0.0.0.0` y `PORT=80`.
-7. Despliega y comprueba `https://SUBDOMINIO.squareweb.app/health`.
-8. Actualiza `assets/js/config.js` con ese origen HTTPS y vuelve a publicar
+6. Registra `https://SUBDOMINIO.squareweb.app/oauth/callback` como Redirect de
+   OAuth2 y usa exactamente esa misma URL en `DISCORD_OAUTH_REDIRECT_URI`.
+7. Conserva `HOST=0.0.0.0` y `PORT=80`.
+8. Despliega y comprueba `https://SUBDOMINIO.squareweb.app/health`.
+9. Actualiza `assets/js/config.js` con ese origen HTTPS y vuelve a publicar
    GitHub Pages.
 
 El servicio no inicia si falta PostgreSQL, un secreto o una variable critica.

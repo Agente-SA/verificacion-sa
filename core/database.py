@@ -32,6 +32,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS verification_tokens_one_issued_user_uidx
     ON verification_tokens (guild_id, user_id)
     WHERE status = 'issued';
 
+CREATE TABLE IF NOT EXISTS verification_oauth_sessions (
+    session_id UUID PRIMARY KEY,
+    state_digest CHAR(64) NOT NULL UNIQUE,
+    token_id UUID NOT NULL
+        REFERENCES verification_tokens(token_id) ON DELETE CASCADE,
+    guild_id BIGINT NOT NULL,
+    expected_user_id BIGINT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'issued'
+        CHECK (
+            status IN (
+                'issued', 'processing', 'completed', 'identity_mismatch',
+                'expired', 'superseded', 'error'
+            )
+        ),
+    signals JSONB NOT NULL DEFAULT '{}'::jsonb,
+    initial_ip_hash CHAR(64) NOT NULL,
+    initial_ip_network_hash CHAR(64),
+    hash_key_version INTEGER NOT NULL DEFAULT 1,
+    oauth_user_id BIGINT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    processing_started_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    last_error TEXT,
+    CHECK (expires_at > created_at)
+);
+CREATE INDEX IF NOT EXISTS verification_oauth_sessions_token_idx
+    ON verification_oauth_sessions (token_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS verification_oauth_sessions_expiration_idx
+    ON verification_oauth_sessions (expires_at)
+    WHERE status IN ('issued', 'processing');
+
 CREATE TABLE IF NOT EXISTS verification_attempts (
     id BIGSERIAL PRIMARY KEY,
     token_id UUID UNIQUE
@@ -66,6 +98,21 @@ CREATE TABLE IF NOT EXISTS verification_attempts (
     decision TEXT NOT NULL DEFAULT 'pending'
         CHECK (decision IN ('pending', 'approved', 'review', 'rejected', 'error')),
     role_granted BOOLEAN NOT NULL DEFAULT FALSE,
+    role_delivery_status TEXT NOT NULL DEFAULT 'not_required'
+        CHECK (
+            role_delivery_status IN (
+                'not_required', 'approved_pending_role', 'processing',
+                'granted', 'failed'
+            )
+        ),
+    role_attempts SMALLINT NOT NULL DEFAULT 0,
+    role_claimed_at TIMESTAMP WITH TIME ZONE,
+    role_next_retry_at TIMESTAMP WITH TIME ZONE,
+    role_last_error TEXT,
+    role_granted_at TIMESTAMP WITH TIME ZONE,
+    user_notified_at TIMESTAMP WITH TIME ZONE,
+    staff_notified_at TIMESTAMP WITH TIME ZONE,
+    role_error_notified_at TIMESTAMP WITH TIME ZONE,
     possible_main_user_id BIGINT,
     manual_review_required BOOLEAN NOT NULL DEFAULT FALSE,
     manual_review_status TEXT NOT NULL DEFAULT 'not_required'
@@ -158,10 +205,49 @@ ALTER TABLE verification_attempts
     ADD COLUMN IF NOT EXISTS staff_channel_id BIGINT,
     ADD COLUMN IF NOT EXISTS staff_message_id BIGINT,
     ADD COLUMN IF NOT EXISTS appeal_accepted BOOLEAN NOT NULL DEFAULT FALSE,
-    ADD COLUMN IF NOT EXISTS false_positive BOOLEAN NOT NULL DEFAULT FALSE;
+    ADD COLUMN IF NOT EXISTS false_positive BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS role_delivery_status TEXT NOT NULL DEFAULT 'not_required',
+    ADD COLUMN IF NOT EXISTS role_attempts SMALLINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS role_claimed_at TIMESTAMP WITH TIME ZONE,
+    ADD COLUMN IF NOT EXISTS role_next_retry_at TIMESTAMP WITH TIME ZONE,
+    ADD COLUMN IF NOT EXISTS role_last_error TEXT,
+    ADD COLUMN IF NOT EXISTS role_granted_at TIMESTAMP WITH TIME ZONE,
+    ADD COLUMN IF NOT EXISTS user_notified_at TIMESTAMP WITH TIME ZONE,
+    ADD COLUMN IF NOT EXISTS staff_notified_at TIMESTAMP WITH TIME ZONE,
+    ADD COLUMN IF NOT EXISTS role_error_notified_at TIMESTAMP WITH TIME ZONE;
+UPDATE verification_attempts
+SET role_delivery_status='granted',
+    role_granted_at=COALESCE(role_granted_at, updated_at),
+    user_notified_at=COALESCE(user_notified_at, updated_at),
+    staff_notified_at=COALESCE(staff_notified_at, updated_at)
+WHERE decision='approved'
+  AND role_granted=TRUE
+  AND role_delivery_status='not_required';
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname='verification_attempts_role_delivery_status_check'
+    ) THEN
+        ALTER TABLE verification_attempts
+        ADD CONSTRAINT verification_attempts_role_delivery_status_check
+        CHECK (
+            role_delivery_status IN (
+                'not_required', 'approved_pending_role', 'processing',
+                'granted', 'failed'
+            )
+        );
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS verification_attempts_manual_review_idx
     ON verification_attempts (manual_review_status, created_at DESC)
     WHERE manual_review_required=TRUE;
+CREATE INDEX IF NOT EXISTS verification_attempts_role_delivery_idx
+    ON verification_attempts (role_delivery_status, role_next_retry_at, id)
+    WHERE role_delivery_status IN (
+        'approved_pending_role', 'processing', 'failed'
+    );
 """
 
 
@@ -344,6 +430,7 @@ async def init_db() -> None:
     if any(cleanup.values()):
         print(
             "Retención inicial aplicada: "
+            f"{cleanup['oauth']} sesión(es) OAuth, "
             f"{cleanup['attempts']} intento(s), "
             f"{cleanup['tokens']} token(s) y "
             f"{cleanup['antifraud']} señal(es) eliminados."
@@ -409,6 +496,197 @@ async def revoke_verification_token(token_id, token_digest):
             token_id,
             token_digest,
         )
+
+
+async def create_oauth_session(
+    *,
+    session_id,
+    state_digest,
+    token_id,
+    token_digest,
+    guild_id,
+    expected_user_id,
+    signals,
+    initial_ip_hash,
+    initial_ip_network_hash,
+    hash_key_version,
+    expires_at,
+):
+    signals_json = json.dumps(
+        signals,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    async with _pool().acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock($1::BIGINT)",
+                expected_user_id,
+            )
+            await conn.execute(
+                """
+                UPDATE verification_tokens
+                SET status='expired'
+                WHERE token_id=$1
+                  AND token_digest=$2
+                  AND status='issued'
+                  AND expires_at <= CURRENT_TIMESTAMP
+                """,
+                token_id,
+                token_digest,
+            )
+            valid_token = await conn.fetchrow(
+                """
+                SELECT expires_at
+                FROM verification_tokens
+                WHERE token_id=$1
+                  AND token_digest=$2
+                  AND guild_id=$3
+                  AND user_id=$4
+                  AND status='issued'
+                  AND expires_at > CURRENT_TIMESTAMP
+                FOR UPDATE
+                """,
+                token_id,
+                token_digest,
+                guild_id,
+                expected_user_id,
+            )
+            if valid_token is None:
+                return None
+
+            await conn.execute(
+                """
+                UPDATE verification_oauth_sessions
+                SET status='superseded',
+                    completed_at=CURRENT_TIMESTAMP
+                WHERE token_id=$1
+                  AND status IN ('issued', 'processing')
+                """,
+                token_id,
+            )
+            return await conn.fetchrow(
+                """
+                INSERT INTO verification_oauth_sessions (
+                    session_id, state_digest, token_id, guild_id,
+                    expected_user_id, signals, initial_ip_hash,
+                    initial_ip_network_hash, hash_key_version, expires_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9,
+                    LEAST($10::TIMESTAMPTZ, $11::TIMESTAMPTZ)
+                )
+                RETURNING *
+                """,
+                session_id,
+                state_digest,
+                token_id,
+                guild_id,
+                expected_user_id,
+                signals_json,
+                initial_ip_hash,
+                initial_ip_network_hash,
+                hash_key_version,
+                expires_at,
+                valid_token["expires_at"],
+            )
+
+
+async def claim_oauth_session(state_digest):
+    async with _pool().acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE verification_oauth_sessions
+                SET status='expired',
+                    completed_at=CURRENT_TIMESTAMP
+                WHERE state_digest=$1
+                  AND status='issued'
+                  AND expires_at <= CURRENT_TIMESTAMP
+                """,
+                state_digest,
+            )
+            return await conn.fetchrow(
+                """
+                UPDATE verification_oauth_sessions AS oauth
+                SET status='processing',
+                    processing_started_at=CURRENT_TIMESTAMP,
+                    last_error=NULL
+                FROM verification_tokens AS token
+                WHERE oauth.state_digest=$1
+                  AND oauth.status='issued'
+                  AND oauth.expires_at > CURRENT_TIMESTAMP
+                  AND token.token_id=oauth.token_id
+                  AND token.status='issued'
+                  AND token.expires_at > CURRENT_TIMESTAMP
+                RETURNING oauth.*, token.token_digest,
+                          token.expires_at AS token_expires_at
+                """,
+                state_digest,
+            )
+
+
+async def complete_oauth_session(
+    session_id,
+    status,
+    *,
+    oauth_user_id=None,
+    last_error=None,
+):
+    allowed_statuses = {
+        "completed",
+        "identity_mismatch",
+        "expired",
+        "error",
+    }
+    if status not in allowed_statuses:
+        raise ValueError("Estado final OAuth invalido.")
+    async with _pool().acquire() as conn:
+        return await conn.fetchrow(
+            """
+            UPDATE verification_oauth_sessions
+            SET status=$2,
+                oauth_user_id=$3,
+                completed_at=CURRENT_TIMESTAMP,
+                last_error=$4
+            WHERE session_id=$1 AND status='processing'
+            RETURNING *
+            """,
+            session_id,
+            status,
+            oauth_user_id,
+            (last_error or "")[:500] or None,
+        )
+
+
+async def get_oauth_start_counts(
+    guild_id,
+    expected_user_id,
+    initial_ip_hashes,
+    since,
+):
+    if isinstance(initial_ip_hashes, str):
+        initial_ip_hashes = (initial_ip_hashes,)
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE expected_user_id=$2
+                ) AS user_count,
+                COUNT(*) FILTER (
+                    WHERE initial_ip_hash::TEXT=ANY($3::TEXT[])
+                ) AS ip_count
+            FROM verification_oauth_sessions
+            WHERE guild_id=$1 AND created_at >= $4
+            """,
+            guild_id,
+            expected_user_id,
+            list(initial_ip_hashes),
+            since,
+        )
+        return int(row["user_count"]), int(row["ip_count"])
 
 
 async def get_verification_submission_counts(
@@ -784,6 +1062,215 @@ async def finalize_verification_attempt(
             return updated
 
 
+async def queue_approved_role_delivery(
+    attempt_id,
+    *,
+    risk_score,
+    risk_level,
+    possible_main_user_id,
+    risk_reasons,
+    conn=None,
+):
+    reasons_json = json.dumps(
+        risk_reasons,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    async with _connection(conn) as active_conn:
+        return await active_conn.fetchrow(
+            """
+            UPDATE verification_attempts
+            SET risk_score=$2,
+                risk_level=$3,
+                decision='pending',
+                role_granted=FALSE,
+                role_delivery_status='approved_pending_role',
+                role_next_retry_at=CURRENT_TIMESTAMP,
+                role_last_error=NULL,
+                possible_main_user_id=$4,
+                risk_reasons=$5::jsonb,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1
+              AND decision='pending'
+              AND role_delivery_status='not_required'
+            RETURNING *
+            """,
+            attempt_id,
+            risk_score,
+            risk_level,
+            possible_main_user_id,
+            reasons_json,
+        )
+
+
+async def claim_pending_role_delivery(attempt_id=None):
+    async with _pool().acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id
+                FROM verification_attempts
+                WHERE ($1::BIGINT IS NULL OR id=$1)
+                  AND (
+                        (
+                            role_delivery_status IN (
+                                'approved_pending_role', 'failed'
+                            )
+                            AND COALESCE(
+                                role_next_retry_at,
+                                CURRENT_TIMESTAMP
+                            ) <= CURRENT_TIMESTAMP
+                        )
+                        OR (
+                            role_delivery_status='processing'
+                            AND role_claimed_at < (
+                                CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                            )
+                        )
+                  )
+                ORDER BY created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+                """,
+                attempt_id,
+            )
+            if row is None:
+                return None
+            return await conn.fetchrow(
+                """
+                UPDATE verification_attempts
+                SET role_delivery_status='processing',
+                    role_attempts=LEAST(role_attempts + 1, 32767),
+                    role_claimed_at=CURRENT_TIMESTAMP,
+                    role_last_error=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=$1
+                RETURNING *
+                """,
+                row["id"],
+            )
+
+
+async def recover_role_deliveries_on_startup():
+    async with _pool().acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE verification_attempts
+            SET role_delivery_status=CASE
+                    WHEN role_delivery_status='processing'
+                    THEN 'approved_pending_role'
+                    ELSE role_delivery_status
+                END,
+                role_claimed_at=NULL,
+                role_next_retry_at=CURRENT_TIMESTAMP,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE role_delivery_status IN ('processing', 'failed')
+            """
+        )
+    return int(result.rsplit(" ", 1)[-1])
+
+
+async def complete_role_delivery(attempt_id):
+    async with _pool().acquire() as conn:
+        async with conn.transaction():
+            updated = await conn.fetchrow(
+                """
+                UPDATE verification_attempts
+                SET decision='approved',
+                    role_granted=TRUE,
+                    role_delivery_status='granted',
+                    role_granted_at=COALESCE(
+                        role_granted_at,
+                        CURRENT_TIMESTAMP
+                    ),
+                    role_claimed_at=NULL,
+                    role_next_retry_at=NULL,
+                    role_last_error=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=$1
+                  AND role_delivery_status='processing'
+                RETURNING *
+                """,
+                attempt_id,
+            )
+            if updated is not None:
+                await _persist_approved_verification(conn, updated)
+            return updated
+
+
+async def reschedule_role_delivery(
+    attempt_id,
+    error,
+    *,
+    retry_after_seconds,
+    permanent=False,
+):
+    status = "failed" if permanent else "approved_pending_role"
+    async with _pool().acquire() as conn:
+        return await conn.fetchrow(
+            """
+            UPDATE verification_attempts
+            SET role_delivery_status=$2,
+                role_claimed_at=NULL,
+                role_next_retry_at=(
+                    CURRENT_TIMESTAMP
+                    + ($3::INTEGER * INTERVAL '1 second')
+                ),
+                role_last_error=$4,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1
+              AND role_delivery_status='processing'
+            RETURNING *
+            """,
+            attempt_id,
+            status,
+            max(1, int(retry_after_seconds)),
+            str(error)[:1000],
+        )
+
+
+async def mark_role_notification(attempt_id, audience):
+    columns = {
+        "user": "user_notified_at",
+        "staff": "staff_notified_at",
+        "error": "role_error_notified_at",
+    }
+    column = columns.get(audience)
+    if column is None:
+        raise ValueError("Audiencia de notificacion invalida.")
+    async with _pool().acquire() as conn:
+        return await conn.fetchrow(
+            f"""
+            UPDATE verification_attempts
+            SET {column}=CURRENT_TIMESTAMP,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1 AND {column} IS NULL
+            RETURNING *
+            """,
+            attempt_id,
+        )
+
+
+async def get_unnotified_approved_role_deliveries(limit=25):
+    async with _pool().acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT *
+            FROM verification_attempts
+            WHERE role_delivery_status='granted'
+              AND decision='approved'
+              AND role_granted=TRUE
+              AND (
+                    user_notified_at IS NULL
+                    OR staff_notified_at IS NULL
+              )
+            ORDER BY role_granted_at ASC NULLS FIRST
+            LIMIT $1
+            """,
+            max(1, min(int(limit), 100)),
+        )
+
+
 async def save_manual_review_message(
     attempt_id,
     channel_id,
@@ -878,15 +1365,24 @@ async def complete_manual_review(
     async with _pool().acquire() as conn:
         async with conn.transaction():
             status = "accepted" if accepted else "rejected"
-            decision = "approved" if accepted else "rejected"
+            decision = "review" if accepted else "rejected"
+            delivery_status = (
+                "approved_pending_role" if accepted else "not_required"
+            )
             updated = await conn.fetchrow(
                 """
                 UPDATE verification_attempts
                 SET manual_review_status=$3,
                     decision=$4,
-                    role_granted=$5,
+                    role_granted=FALSE,
+                    role_delivery_status=$5,
+                    role_next_retry_at=CASE
+                        WHEN $6::BOOLEAN THEN CURRENT_TIMESTAMP
+                        ELSE NULL
+                    END,
+                    role_last_error=NULL,
                     reviewed_at=CURRENT_TIMESTAMP,
-                    false_positive=$5,
+                    false_positive=$6,
                     updated_at=CURRENT_TIMESTAMP
                 WHERE id=$1
                   AND manual_review_status='processing'
@@ -897,10 +1393,9 @@ async def complete_manual_review(
                 reviewer_id,
                 status,
                 decision,
+                delivery_status,
                 accepted,
             )
-            if updated is not None and accepted:
-                await _persist_approved_verification(conn, updated)
             return updated
 
 
@@ -980,6 +1475,16 @@ async def clear_verification_records(guild_id, user_id):
 
 
 async def _purge_expired_verification_data(conn):
+    deleted_oauth = await conn.fetchval(
+        """
+        WITH deleted AS (
+            DELETE FROM verification_oauth_sessions
+            WHERE expires_at <= (CURRENT_TIMESTAMP - INTERVAL '1 day')
+            RETURNING session_id
+        )
+        SELECT COUNT(*) FROM deleted
+        """
+    )
     deleted_attempts = await conn.fetchval(
         """
         WITH deleted AS (
@@ -1011,6 +1516,7 @@ async def _purge_expired_verification_data(conn):
         """
     )
     return {
+        "oauth": int(deleted_oauth or 0),
         "attempts": int(deleted_attempts or 0),
         "tokens": int(deleted_tokens or 0),
         "antifraud": int(deleted_antifraud or 0),
