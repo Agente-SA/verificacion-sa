@@ -39,7 +39,7 @@ class VPNDetectionParserTests(unittest.TestCase):
         self.assertTrue(result.detected)
         self.assertEqual(result.signals, ("vpn",))
         self.assertIs(result.signal_state("vpn"), True)
-        self.assertIs(result.signal_state("proxy"), False)
+        self.assertIsNone(result.signal_state("proxy"))
         self.assertIsNone(result.signal_state("datacenter"))
         self.assertEqual(result.risk_score, 52)
         self.assertEqual(result.confidence_score, 91)
@@ -48,7 +48,7 @@ class VPNDetectionParserTests(unittest.TestCase):
         self.assertEqual(result.network_type, "Wireless")
         self.assertEqual(result.network_provider, "Example Mobile")
 
-    def test_proxycheck_hosting_alone_is_not_an_anonymizer_detection(self):
+    def test_proxycheck_hosting_field_does_not_affect_vpn_detection(self):
         result = parse_proxycheck_response(
             {
                 "status": "ok",
@@ -70,9 +70,9 @@ class VPNDetectionParserTests(unittest.TestCase):
         )
 
         self.assertFalse(result.detected)
-        self.assertEqual(result.signals, ("hosting",))
+        self.assertEqual(result.signals, ())
 
-    def test_ipapi_detects_vpn_proxy_or_tor(self):
+    def test_ipapi_proxy_without_vpn_is_context_only(self):
         result = parse_ipapi_response(
             {
                 "ip": "203.0.113.10",
@@ -88,11 +88,8 @@ class VPNDetectionParserTests(unittest.TestCase):
             "203.0.113.10",
         )
 
-        self.assertTrue(result.detected)
-        self.assertEqual(
-            result.signals,
-            ("proxy", "hosting", "datacenter"),
-        )
+        self.assertFalse(result.detected)
+        self.assertEqual(result.signals, ())
         self.assertEqual(result.network_provider, "Example Hosting")
 
     def test_ipapi_does_not_reject_datacenter_alone(self):
@@ -108,7 +105,7 @@ class VPNDetectionParserTests(unittest.TestCase):
         )
 
         self.assertFalse(result.detected)
-        self.assertEqual(result.signals, ("datacenter",))
+        self.assertEqual(result.signals, ())
 
     def test_ipapi_preserves_vpn_service_and_last_seen(self):
         result = parse_ipapi_response(
@@ -170,15 +167,9 @@ class VPNDetectionParserTests(unittest.TestCase):
             proxycheck=ProviderVerdict(
                 provider="proxycheck.io",
                 available=True,
-                detected=True,
-                signals=("proxy",),
-                signal_states=(
-                    ("vpn", False),
-                    ("proxy", True),
-                    ("tor", False),
-                    ("hosting", False),
-                    ("datacenter", None),
-                ),
+                detected=False,
+                signals=(),
+                signal_states=(("vpn", False),),
                 risk_score=61,
                 confidence_score=89,
                 last_seen="2026-08-03T22:15:00Z",
@@ -187,31 +178,22 @@ class VPNDetectionParserTests(unittest.TestCase):
                 provider="ipapi.is",
                 available=True,
                 detected=False,
-                signal_states=tuple(
-                    (signal, False)
-                    for signal in (
-                        "vpn",
-                        "proxy",
-                        "tor",
-                        "hosting",
-                        "datacenter",
-                    )
-                ),
+                signal_states=(("vpn", False),),
             ),
         )
 
         stored = result.provider_results()["proxycheck.io"]
-        self.assertEqual(stored["checks"]["proxy"], True)
+        self.assertNotIn("proxy", stored["checks"])
         self.assertEqual(stored["risk_score"], 61)
         self.assertEqual(stored["confidence_score"], 89)
         self.assertEqual(stored["last_seen"], "2026-08-03T22:15:00Z")
         summary = result.discord_summary()
         self.assertIn("VPN `No`", summary)
-        self.assertIn("Proxy `Sí`", summary)
-        self.assertIn("Tor `No`", summary)
-        self.assertIn("Hosting `No`", summary)
-        self.assertIn("Datacenter `N/D`", summary)
-        self.assertIn("Señal aislada", summary)
+        self.assertNotIn("Proxy", summary)
+        self.assertNotIn("Tor", summary)
+        self.assertNotIn("Hosting", summary)
+        self.assertNotIn("Datacenter", summary)
+        self.assertNotIn("Señal aislada", summary)
 
     def test_both_unavailable_are_not_evaluated(self):
         result = VPNCheckResult(

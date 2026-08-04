@@ -148,7 +148,7 @@ class VerificationRiskTests(unittest.TestCase):
             [],
             now=NOW,
             vpn_detected_by=("proxycheck.io",),
-            vpn_detected_signals={"proxycheck.io": ("proxy",)},
+            vpn_detected_signals={"proxycheck.io": ("vpn",)},
         )
 
         self.assertEqual(result.score, 30)
@@ -156,7 +156,7 @@ class VerificationRiskTests(unittest.TestCase):
         self.assertEqual(result.decision, "review")
         self.assertIsNone(result.possible_main_user_id)
         self.assertIn(
-            "Señal de proxy detectada por proxycheck.io",
+            "Señal de VPN detectada por proxycheck.io",
             result.reasons,
         )
 

@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -48,7 +49,7 @@ from core.vpn_detection import VPNCheckResult, check_vpn_services
 
 logger = logging.getLogger(__name__)
 API_NAME = "verification-sa-api"
-API_VERSION = 4
+API_VERSION = 5
 MAX_REQUEST_SIZE = 64 * 1024
 RATE_WINDOW = timedelta(minutes=15)
 USER_SUBMISSION_LIMIT = 5
@@ -71,6 +72,7 @@ DISCORD_AUTHORIZE_URL = "https://discord.com/oauth2/authorize"
 DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
 DISCORD_CURRENT_USER_URL = "https://discord.com/api/v10/users/@me"
 OAUTH_HTTP_TIMEOUT = ClientTimeout(total=15)
+SERVICE_READY_GRACE_SECONDS = 12
 
 
 class InvalidSubmission(ValueError):
@@ -105,6 +107,26 @@ def _error_response(code: str, status: int) -> web.Response:
         {"status": "error", "code": code},
         status=status,
     )
+
+
+async def _wait_for_guardian_ready(bot) -> bool:
+    if database.bot_pool is None:
+        return False
+    if bot.is_ready():
+        return True
+
+    try:
+        await asyncio.wait_for(
+            bot.wait_until_ready(),
+            timeout=SERVICE_READY_GRACE_SECONDS,
+        )
+    except (TimeoutError, RuntimeError):
+        logger.warning(
+            "Guardian no recuperó la conexión con Discord dentro de %s segundos.",
+            SERVICE_READY_GRACE_SECONDS,
+        )
+        return False
+    return database.bot_pool is not None and bot.is_ready()
 
 
 def _oauth_state_digest(state: str) -> str:
@@ -873,11 +895,17 @@ def create_verification_app(bot) -> web.Application:
         return response
 
     async def health(_request: web.Request) -> web.Response:
+        discord_ready = bot.is_ready()
+        database_ready = database.bot_pool is not None
         return web.json_response(
             {
-                "status": "ok",
+                "status": (
+                    "ok" if discord_ready and database_ready else "degraded"
+                ),
                 "service": API_NAME,
                 "version": API_VERSION,
+                "discord_ready": discord_ready,
+                "database_ready": database_ready,
             }
         )
 
@@ -885,7 +913,7 @@ def create_verification_app(bot) -> web.Application:
         request: web.Request,
         oauth_session,
     ) -> web.Response:
-        if database.bot_pool is None or not bot.is_ready():
+        if not await _wait_for_guardian_ready(bot):
             return _error_response("temporarily_unavailable", 503)
 
         try:
@@ -1238,7 +1266,7 @@ def create_verification_app(bot) -> web.Application:
         return web.json_response({"status": "received"}, status=202)
 
     async def start_oauth(request: web.Request) -> web.Response:
-        if database.bot_pool is None or not bot.is_ready():
+        if not await _wait_for_guardian_ready(bot):
             return _error_response("temporarily_unavailable", 503)
         if request.content_type != "application/json":
             return _error_response("invalid_request", 415)
@@ -1353,7 +1381,7 @@ def create_verification_app(bot) -> web.Application:
         )
 
     async def oauth_callback(request: web.Request) -> web.Response:
-        if database.bot_pool is None or not bot.is_ready():
+        if not await _wait_for_guardian_ready(bot):
             raise _oauth_redirect("retry")
 
         state = request.query.get("state", "")

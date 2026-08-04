@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 try:
@@ -13,6 +13,7 @@ try:
         _oauth_result_url,
         _oauth_state_digest,
         _remove_legacy_verified_role,
+        _wait_for_guardian_ready,
     )
     from core.verification_risk import RiskAssessment
     from modules.verificacion import (
@@ -71,6 +72,20 @@ class OAuthFlowTests(unittest.TestCase):
         )
         self.assertEqual(signals["language"], "es")
         self.assertEqual(signals["signal_version"], 1)
+
+
+class ServiceReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transient_gateway_reconnect_gets_a_grace_window(self):
+        bot = SimpleNamespace(
+            is_ready=Mock(side_effect=(False, True)),
+            wait_until_ready=AsyncMock(),
+        )
+
+        with patch("api.verification_api.database.bot_pool", object()):
+            ready = await _wait_for_guardian_ready(bot)
+
+        self.assertTrue(ready)
+        bot.wait_until_ready.assert_awaited_once_with()
 
 
 class RoleDeliveryTests(unittest.IsolatedAsyncioTestCase):

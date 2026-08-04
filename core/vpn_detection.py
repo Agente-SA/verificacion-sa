@@ -14,8 +14,8 @@ PROXYCHECK_URL = "https://proxycheck.io/v3/{ip_address}"
 IPAPI_URL = "https://api.ipapi.is"
 REQUEST_TIMEOUT_SECONDS = 4
 MAX_RESPONSE_BYTES = 128 * 1024
-DISPLAY_SIGNALS = ("vpn", "proxy", "tor", "hosting", "datacenter")
-ANONYMITY_SIGNALS = frozenset(("vpn", "proxy", "tor"))
+DISPLAY_SIGNALS = ("vpn",)
+ANONYMITY_SIGNALS = frozenset(("vpn",))
 SIGNAL_LABELS = {
     "vpn": "VPN",
     "proxy": "Proxy",
@@ -199,8 +199,7 @@ class VPNCheckResult:
                 state = verdict.signal_state(signal)
                 state_label = "Sí" if state is True else "No" if state is False else "N/D"
                 states.append(f"{SIGNAL_LABELS[signal]} `{state_label}`")
-            lines.append(" · ".join(states[:3]))
-            lines.append(" · ".join(states[3:]))
+            lines.append(" · ".join(states))
 
             risk = (
                 f"{verdict.risk_score}/100"
@@ -262,13 +261,13 @@ def parse_proxycheck_response(payload: object, ip_address: str) -> ProviderVerdi
     detections = result.get("detections")
     if not isinstance(detections, dict):
         raise InvalidProviderResponse("Detecciones ausentes de proxycheck.io.")
-    checked_fields = ("vpn", "proxy", "tor", "hosting")
+    checked_fields = ("vpn",)
     if any(type(detections.get(field)) is not bool for field in checked_fields):
         raise InvalidProviderResponse("Detecciones invalidas de proxycheck.io.")
 
     signal_states = tuple(
         (signal, detections[signal]) for signal in checked_fields
-    ) + (("datacenter", None),)
+    )
     signals = tuple(signal for signal, state in signal_states if state is True)
     network = _nested_dict(result, "network")
     operator = _nested_dict(result, "operator")
@@ -297,29 +296,14 @@ def parse_ipapi_response(payload: object, ip_address: str) -> ProviderVerdict:
     if not isinstance(payload, dict) or not _same_ip(payload.get("ip"), ip_address):
         raise InvalidProviderResponse("Resultado invalido de ipapi.is.")
 
-    checked_fields = ("is_vpn", "is_proxy", "is_tor")
+    checked_fields = ("is_vpn",)
     if any(type(payload.get(field)) is not bool for field in checked_fields):
         raise InvalidProviderResponse("Detecciones ausentes de ipapi.is.")
 
     company = _nested_dict(payload, "company")
     asn = _nested_dict(payload, "asn")
-    datacenter = _nested_dict(payload, "datacenter")
     vpn = _nested_dict(payload, "vpn")
-    datacenter_detected = (
-        payload.get("is_datacenter") is True or bool(datacenter)
-    )
-    hosting_detected = (
-        payload.get("is_hosting") is True
-        or str(company.get("type", "")).lower() == "hosting"
-        or str(asn.get("type", "")).lower() == "hosting"
-    )
-    signal_states = (
-        ("vpn", payload["is_vpn"]),
-        ("proxy", payload["is_proxy"]),
-        ("tor", payload["is_tor"]),
-        ("hosting", hosting_detected),
-        ("datacenter", datacenter_detected),
-    )
+    signal_states = (("vpn", payload["is_vpn"]),)
     signals = tuple(signal for signal, state in signal_states if state is True)
     return ProviderVerdict(
         provider=IPAPI_PROVIDER,
@@ -331,10 +315,7 @@ def parse_ipapi_response(payload: object, ip_address: str) -> ProviderVerdict:
             _iso_timestamp(vpn.get("last_seen_str"))
             or _iso_timestamp(vpn.get("last_seen"))
         ),
-        service=(
-            _clean_text(vpn.get("service"))
-            or _clean_text(datacenter.get("datacenter"))
-        ),
+        service=_clean_text(vpn.get("service")),
         network_type=(
             _clean_text(company.get("type"))
             or _clean_text(asn.get("type"))
