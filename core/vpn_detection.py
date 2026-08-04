@@ -3,6 +3,7 @@ import ipaddress
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 
@@ -13,6 +14,15 @@ PROXYCHECK_URL = "https://proxycheck.io/v3/{ip_address}"
 IPAPI_URL = "https://api.ipapi.is"
 REQUEST_TIMEOUT_SECONDS = 4
 MAX_RESPONSE_BYTES = 128 * 1024
+DISPLAY_SIGNALS = ("vpn", "proxy", "tor", "hosting", "datacenter")
+ANONYMITY_SIGNALS = frozenset(("vpn", "proxy", "tor"))
+SIGNAL_LABELS = {
+    "vpn": "VPN",
+    "proxy": "Proxy",
+    "tor": "Tor",
+    "hosting": "Hosting",
+    "datacenter": "Datacenter",
+}
 
 
 class InvalidProviderResponse(ValueError):
@@ -28,16 +38,82 @@ def _same_ip(value: object, expected: str) -> bool:
         return False
 
 
+def _clean_text(value: object, limit: int = 120) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split()).strip()
+    return cleaned[:limit] or None
+
+
+def _score(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or not 0 <= value <= 100:
+        raise InvalidProviderResponse(f"{field_name} invalido.")
+    return value
+
+
+def _iso_timestamp(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            parsed = datetime.fromtimestamp(value / 1000, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return parsed.isoformat().replace("+00:00", "Z")
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _discord_timestamp(value: str | None) -> str:
+    if not value:
+        return "No proporcionada"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value[:64]
+    return f"<t:{int(parsed.timestamp())}:f> (<t:{int(parsed.timestamp())}:R>)"
+
+
+def _nested_dict(payload: dict, key: str) -> dict:
+    value = payload.get(key)
+    return value if isinstance(value, dict) else {}
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderVerdict:
     provider: str
     available: bool
     detected: bool
     signals: tuple[str, ...] = ()
+    signal_states: tuple[tuple[str, bool | None], ...] = ()
+    risk_score: int | None = None
+    confidence_score: int | None = None
+    last_seen: str | None = None
+    service: str | None = None
+    network_type: str | None = None
+    network_provider: str | None = None
 
     @classmethod
     def unavailable(cls, provider: str) -> "ProviderVerdict":
         return cls(provider=provider, available=False, detected=False)
+
+    def signal_state(self, signal: str) -> bool | None:
+        return dict(self.signal_states).get(signal)
+
+    @property
+    def anonymity_signals(self) -> tuple[str, ...]:
+        return tuple(
+            signal for signal in self.signals if signal in ANONYMITY_SIGNALS
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,29 +168,73 @@ class VPNCheckResult:
                 "available": verdict.available,
                 "detected": verdict.detected,
                 "signals": list(verdict.signals),
+                "checks": dict(verdict.signal_states),
+                "risk_score": verdict.risk_score,
+                "confidence_score": verdict.confidence_score,
+                "last_seen": verdict.last_seen,
+                "service": verdict.service,
+                "network_type": verdict.network_type,
+                "network_provider": verdict.network_provider,
             }
             for verdict in self.verdicts
+        }
+
+    def detected_signal_map(self) -> dict[str, tuple[str, ...]]:
+        return {
+            verdict.provider: verdict.anonymity_signals
+            for verdict in self.verdicts
+            if verdict.available and verdict.detected
         }
 
     def discord_summary(self) -> str:
         lines = []
         for verdict in self.verdicts:
+            lines.append(f"**{verdict.provider}**")
             if not verdict.available:
-                status = "Sin respuesta"
-            elif verdict.detected:
-                status = "Detectado"
-            else:
-                status = "No detectado"
-            lines.append(f"**{verdict.provider}:** {status}")
+                lines.append("Servicio sin respuesta")
+                continue
+
+            states = []
+            for signal in DISPLAY_SIGNALS:
+                state = verdict.signal_state(signal)
+                state_label = "Sí" if state is True else "No" if state is False else "N/D"
+                states.append(f"{SIGNAL_LABELS[signal]} `{state_label}`")
+            lines.append(" · ".join(states[:3]))
+            lines.append(" · ".join(states[3:]))
+
+            risk = (
+                f"{verdict.risk_score}/100"
+                if verdict.risk_score is not None
+                else "N/D"
+            )
+            confidence = (
+                f"{verdict.confidence_score}/100"
+                if verdict.confidence_score is not None
+                else "N/D"
+            )
+            lines.append(f"Riesgo `{risk}` · Confianza `{confidence}`")
+            lines.append(f"Última detección: {_discord_timestamp(verdict.last_seen)}")
+
+            context = []
+            if verdict.service:
+                context.append(f"Servicio: `{verdict.service}`")
+            if verdict.network_type:
+                context.append(f"Red: `{verdict.network_type}`")
+            if verdict.network_provider:
+                context.append(f"Proveedor: `{verdict.network_provider}`")
+            if context:
+                lines.append(" · ".join(context))
 
         detected_count = len(self.detected_providers)
         if detected_count == 2:
-            lines.append("**Confianza:** Alta")
+            lines.append("**Coincidencia de proveedores:** Sí")
         elif detected_count == 1:
-            lines.append("**Confianza:** Revisión manual")
+            lines.append("**Señal aislada:** Revisión manual")
         elif self.available_count == 0:
             lines.append("**Estado:** Servicios no disponibles")
-        return "\n".join(lines)
+        else:
+            lines.append("**Coincidencia de proveedores:** No detectada")
+        return "\n".join(lines)[:1024]
 
 
 def parse_proxycheck_response(payload: object, ip_address: str) -> ProviderVerdict:
@@ -142,27 +262,34 @@ def parse_proxycheck_response(payload: object, ip_address: str) -> ProviderVerdi
     detections = result.get("detections")
     if not isinstance(detections, dict):
         raise InvalidProviderResponse("Detecciones ausentes de proxycheck.io.")
-    anonymous = detections.get("anonymous")
-    if type(anonymous) is not bool:
-        raise InvalidProviderResponse("Deteccion invalida de proxycheck.io.")
+    checked_fields = ("vpn", "proxy", "tor", "hosting")
+    if any(type(detections.get(field)) is not bool for field in checked_fields):
+        raise InvalidProviderResponse("Detecciones invalidas de proxycheck.io.")
 
-    signals = tuple(
-        key
-        for key in (
-            "vpn",
-            "proxy",
-            "tor",
-            "hosting",
-            "datacenter",
-            "anonymous",
-        )
-        if detections.get(key) is True
-    )
+    signal_states = tuple(
+        (signal, detections[signal]) for signal in checked_fields
+    ) + (("datacenter", None),)
+    signals = tuple(signal for signal, state in signal_states if state is True)
+    network = _nested_dict(result, "network")
+    operator = _nested_dict(result, "operator")
     return ProviderVerdict(
         provider=PROXYCHECK_PROVIDER,
         available=True,
-        detected=anonymous,
+        detected=any(signal in ANONYMITY_SIGNALS for signal in signals),
         signals=signals,
+        signal_states=signal_states,
+        risk_score=_score(result.get("risk"), "Riesgo de proxycheck.io"),
+        confidence_score=_score(
+            detections.get("confidence"),
+            "Confianza de proxycheck.io",
+        ),
+        last_seen=_iso_timestamp(detections.get("last_seen")),
+        service=_clean_text(operator.get("name")),
+        network_type=_clean_text(network.get("type")),
+        network_provider=(
+            _clean_text(network.get("provider"))
+            or _clean_text(network.get("organisation"))
+        ),
     )
 
 
@@ -174,22 +301,48 @@ def parse_ipapi_response(payload: object, ip_address: str) -> ProviderVerdict:
     if any(type(payload.get(field)) is not bool for field in checked_fields):
         raise InvalidProviderResponse("Detecciones ausentes de ipapi.is.")
 
-    signals = tuple(
-        field.removeprefix("is_")
-        for field in checked_fields
-        if payload[field]
+    company = _nested_dict(payload, "company")
+    asn = _nested_dict(payload, "asn")
+    datacenter = _nested_dict(payload, "datacenter")
+    vpn = _nested_dict(payload, "vpn")
+    datacenter_detected = (
+        payload.get("is_datacenter") is True or bool(datacenter)
     )
-    if payload.get("is_datacenter") is True:
-        signals += ("datacenter",)
-    if payload.get("is_hosting") is True:
-        signals += ("hosting",)
+    hosting_detected = (
+        payload.get("is_hosting") is True
+        or str(company.get("type", "")).lower() == "hosting"
+        or str(asn.get("type", "")).lower() == "hosting"
+    )
+    signal_states = (
+        ("vpn", payload["is_vpn"]),
+        ("proxy", payload["is_proxy"]),
+        ("tor", payload["is_tor"]),
+        ("hosting", hosting_detected),
+        ("datacenter", datacenter_detected),
+    )
+    signals = tuple(signal for signal, state in signal_states if state is True)
     return ProviderVerdict(
         provider=IPAPI_PROVIDER,
         available=True,
-        detected=any(
-            signal in {"vpn", "proxy", "tor"} for signal in signals
-        ),
+        detected=any(signal in ANONYMITY_SIGNALS for signal in signals),
         signals=signals,
+        signal_states=signal_states,
+        last_seen=(
+            _iso_timestamp(vpn.get("last_seen_str"))
+            or _iso_timestamp(vpn.get("last_seen"))
+        ),
+        service=(
+            _clean_text(vpn.get("service"))
+            or _clean_text(datacenter.get("datacenter"))
+        ),
+        network_type=(
+            _clean_text(company.get("type"))
+            or _clean_text(asn.get("type"))
+        ),
+        network_provider=(
+            _clean_text(company.get("name"))
+            or _clean_text(asn.get("org"))
+        ),
     )
 
 
@@ -209,6 +362,8 @@ async def _read_json_response(response) -> object:
 
 async def _query_proxycheck(session, ip_address: str) -> ProviderVerdict:
     encoded_ip = quote(ip_address, safe="")
+    # API v3 returns all detection types by default. Omitting ``days`` keeps
+    # proxycheck.io's conservative per-source expiration for stale mobile/CGNAT data.
     async with session.get(
         PROXYCHECK_URL.format(ip_address=encoded_ip),
         params={"tag": "0", "p": "0"},

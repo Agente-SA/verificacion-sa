@@ -148,12 +148,17 @@ class VerificationRiskTests(unittest.TestCase):
             [],
             now=NOW,
             vpn_detected_by=("proxycheck.io",),
+            vpn_detected_signals={"proxycheck.io": ("proxy",)},
         )
 
-        self.assertEqual(result.score, 50)
+        self.assertEqual(result.score, 30)
         self.assertEqual(result.level, "medium")
         self.assertEqual(result.decision, "review")
         self.assertIsNone(result.possible_main_user_id)
+        self.assertIn(
+            "Señal de proxy detectada por proxycheck.io",
+            result.reasons,
+        )
 
     def test_two_vpn_providers_are_high_confidence(self):
         result = assess_verification_risk(
@@ -163,9 +168,33 @@ class VerificationRiskTests(unittest.TestCase):
             vpn_detected_by=("proxycheck.io", "ipapi.is"),
         )
 
-        self.assertEqual(result.score, 100)
+        self.assertEqual(result.score, 65)
         self.assertEqual(result.level, "high")
         self.assertEqual(result.decision, "rejected")
+        self.assertIn(
+            "Coincidencia entre los dos proveedores de red",
+            result.reasons,
+        )
+
+    def test_one_provider_only_rejects_when_other_signals_are_strong(self):
+        candidate = attempt(
+            user_id=2,
+            fingerprint_hash="different-fingerprint",
+            country_code="AR",
+            created_at=NOW - timedelta(days=100),
+        )
+
+        result = assess_verification_risk(
+            attempt(),
+            [candidate],
+            now=NOW,
+            vpn_detected_by=("proxycheck.io",),
+            vpn_detected_signals={"proxycheck.io": ("vpn",)},
+        )
+
+        self.assertEqual(result.score, 80)
+        self.assertEqual(result.decision, "rejected")
+        self.assertIn("IP exacta coincidente", result.reasons)
 
     def test_one_unavailable_vpn_provider_uses_reduced_confidence(self):
         result = assess_verification_risk(

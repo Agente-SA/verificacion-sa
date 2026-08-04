@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 REVIEW_THRESHOLD = 30
@@ -13,10 +13,15 @@ NEW_SERVER_MEMBER_WINDOW = timedelta(days=30)
 NEW_ACCOUNT_SCORE = 5
 NEW_SERVER_MEMBER_SCORE = 5
 COUNTRY_NETWORK_MATCH_SCORE = 10
-VPN_SINGLE_PROVIDER_SCORE = 50
-VPN_MULTIPLE_PROVIDER_SCORE = 100
+VPN_SINGLE_PROVIDER_SCORE = REVIEW_THRESHOLD
+VPN_MULTIPLE_PROVIDER_SCORE = REJECTION_THRESHOLD
 VPN_PARTIAL_CHECK_SCORE = 5
 FINGERPRINT_MATCH_SCORE = 15
+VPN_SIGNAL_LABELS = {
+    "vpn": "VPN",
+    "proxy": "proxy",
+    "tor": "Tor",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +103,7 @@ def assess_verification_risk(
     account_created_at: datetime | None = None,
     server_joined_at: datetime | None = None,
     vpn_detected_by: Sequence[str] = (),
+    vpn_detected_signals: Mapping[str, Sequence[str]] | None = None,
     vpn_unavailable_by: Sequence[str] = (),
 ) -> RiskAssessment:
     current_time = _utc_datetime(now or datetime.now(timezone.utc))
@@ -123,8 +129,17 @@ def assess_verification_risk(
         base_score += VPN_MULTIPLE_PROVIDER_SCORE
     elif vpn_providers:
         base_score += VPN_SINGLE_PROVIDER_SCORE
+    provider_signals = vpn_detected_signals or {}
     for provider in vpn_providers:
-        base_reasons.append(f"VPN/Proxy detectado por {provider}")
+        labels = tuple(
+            VPN_SIGNAL_LABELS[signal]
+            for signal in provider_signals.get(provider, ())
+            if signal in VPN_SIGNAL_LABELS
+        )
+        detail = ", ".join(labels) if labels else "anonimizacion"
+        base_reasons.append(f"Señal de {detail} detectada por {provider}")
+    if len(vpn_providers) >= 2:
+        base_reasons.append("Coincidencia entre los dos proveedores de red")
 
     unavailable_providers = tuple(dict.fromkeys(vpn_unavailable_by))
     if len(unavailable_providers) == 1:

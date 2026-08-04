@@ -578,9 +578,9 @@ async def _send_review_alert(
         inline=False,
     )
     embed.add_field(
-        name="VPN / Proxy",
+        name="Análisis de red por proveedor",
         value=vpn_check.discord_summary(),
-        inline=True,
+        inline=False,
     )
     embed.add_field(
         name="Verificacion interna",
@@ -675,9 +675,9 @@ async def _send_rejection_alert(
         inline=False,
     )
     embed.add_field(
-        name="VPN / Proxy",
+        name="Análisis de red por proveedor",
         value=vpn_check.discord_summary(),
-        inline=True,
+        inline=False,
     )
     embed.add_field(
         name="País aproximado",
@@ -932,7 +932,7 @@ def create_verification_app(bot) -> web.Application:
                     vpn_provider_results=vpn_check.provider_results(),
                     vpn_checked_at=current_time,
                     vpn_signal_types=vpn_check.signal_types,
-                    vpn_detected=bool(vpn_check.detected_providers),
+                    vpn_detected="vpn" in vpn_check.signal_types,
                     conn=conn,
                 )
                 if attempt is None:
@@ -969,6 +969,9 @@ def create_verification_app(bot) -> web.Application:
                         account_created_at=member.created_at,
                         server_joined_at=member.joined_at,
                         vpn_detected_by=vpn_check.detected_providers,
+                        vpn_detected_signals=(
+                            vpn_check.detected_signal_map()
+                        ),
                         vpn_unavailable_by=vpn_check.unavailable_providers,
                     )
                     logger.info(
