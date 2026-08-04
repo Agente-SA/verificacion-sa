@@ -4,6 +4,10 @@
   const config = window.VERIFICATION_CONFIG || {};
   const MAX_START_ATTEMPTS = 2;
   const START_RETRY_DELAY_MS = 1800;
+  const OAUTH_RECOVERY_DELAY_MS = 800;
+  const TOKEN_STORAGE_KEY = "guardian.oauth.token";
+  const RETRY_STORAGE_KEY = "guardian.oauth.retry_count";
+  const TOKEN_PATTERN = /^[A-Za-z0-9._~-]{20,2048}$/;
   const verificationPanel = document.getElementById("verification-panel");
   const successPanel = document.getElementById("success-panel");
   const consentInput = document.getElementById("privacy-consent");
@@ -15,24 +19,34 @@
   const resultNote = document.getElementById("result-note");
 
   const oauthResult = readFragmentValue("result");
-  if (["received", "rejected", "retry"].includes(oauthResult)) {
-    showOAuthResult(oauthResult);
-    return;
-  }
-
-  const token = readToken();
-  const tokenIsValid = /^[A-Za-z0-9._~-]{20,2048}$/.test(token);
-
-  if (!tokenIsValid) {
-    linkWarning.classList.remove("is-hidden");
-    consentInput.disabled = true;
-  }
+  const fragmentToken = readToken();
+  const recoveryToken = readStoredToken();
+  const token = TOKEN_PATTERN.test(fragmentToken)
+    ? fragmentToken
+    : oauthResult === "retry" ? recoveryToken : "";
+  const tokenIsValid = TOKEN_PATTERN.test(token);
 
   consentInput.addEventListener("change", function () {
     startButton.disabled = !tokenIsValid || !consentInput.checked;
   });
 
   startButton.addEventListener("click", submitVerification);
+
+  if (["received", "rejected", "retry"].includes(oauthResult)) {
+    if (oauthResult === "retry" && tokenIsValid) {
+      recoverOAuthFlow();
+    } else {
+      showOAuthResult(oauthResult);
+    }
+    return;
+  }
+
+  if (tokenIsValid) {
+    clearStoredFlow();
+  } else {
+    linkWarning.classList.remove("is-hidden");
+    consentInput.disabled = true;
+  }
 
   function readToken() {
     return readFragmentValue("token");
@@ -47,6 +61,7 @@
 
   function showOAuthResult(result) {
     window.history.replaceState(null, "", window.location.pathname);
+    if (result !== "retry") clearStoredFlow();
     verificationPanel.classList.add("is-hidden");
     successPanel.classList.remove("is-hidden");
 
@@ -62,6 +77,29 @@
       resultNote.textContent = "Ningún acceso fue concedido.";
     }
     successPanel.focus?.();
+  }
+
+  function recoverOAuthFlow() {
+    window.history.replaceState(null, "", window.location.pathname);
+    verificationPanel.classList.remove("is-hidden");
+    successPanel.classList.add("is-hidden");
+    linkWarning.classList.add("is-hidden");
+    consentInput.checked = true;
+    consentInput.disabled = false;
+    startButton.disabled = false;
+
+    const retryCount = readStoredRetryCount();
+    if (retryCount < 1) {
+      writeStoredRetryCount(retryCount + 1);
+      showStatus(
+        "La conexión se interrumpió. Recuperaremos tu sesión automáticamente..."
+      );
+      window.setTimeout(submitVerification, OAUTH_RECOVERY_DELAY_MS);
+      return;
+    }
+    showStatus(
+      "Tu sesión continúa disponible. Presiona Iniciar verificación para reanudar."
+    );
   }
 
   function collectLimitedSignals() {
@@ -102,6 +140,7 @@
     }
 
     setLoading(true);
+    storeRecoveryToken(token);
     showStatus("Enviando tu solicitud de forma segura...");
     const signals = collectLimitedSignals();
 
@@ -116,7 +155,7 @@
 
           if (
             result.status === "completed" &&
-            isSafeResultUrl(result.result_url)
+            isSafeResultUrl(result.result_url, apiBaseUrl)
           ) {
             window.location.replace(result.result_url);
             return;
@@ -199,6 +238,7 @@
 
   function showStartError(error) {
     if (error?.code === "invalid_or_expired_link") {
+      clearStoredFlow();
       showStatus(
         "Este enlace ya venció o fue utilizado. Regresa a Discord y genera " +
         "uno nuevo."
@@ -249,11 +289,12 @@
     }
   }
 
-  function isSafeResultUrl(value) {
+  function isSafeResultUrl(value, apiBaseUrl) {
     try {
       const url = new URL(value);
+      const apiOrigin = new URL(apiBaseUrl).origin;
       return url.protocol === "https:" &&
-        url.origin === window.location.origin &&
+        [window.location.origin, apiOrigin].includes(url.origin) &&
         url.hash.startsWith("#result=");
     } catch (_error) {
       return false;
@@ -271,5 +312,47 @@
   function showStatus(message) {
     statusMessage.textContent = message;
     statusMessage.classList.remove("is-hidden");
+  }
+
+  function storeRecoveryToken(value) {
+    try {
+      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, value);
+    } catch (_error) {
+      // El flujo principal continúa aunque el navegador bloquee sessionStorage.
+    }
+  }
+
+  function readStoredToken() {
+    try {
+      return window.sessionStorage.getItem(TOKEN_STORAGE_KEY) || "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function readStoredRetryCount() {
+    try {
+      const value = Number(window.sessionStorage.getItem(RETRY_STORAGE_KEY));
+      return Number.isInteger(value) && value >= 0 ? value : 0;
+    } catch (_error) {
+      return 0;
+    }
+  }
+
+  function writeStoredRetryCount(value) {
+    try {
+      window.sessionStorage.setItem(RETRY_STORAGE_KEY, String(value));
+    } catch (_error) {
+      // La recuperación manual sigue disponible.
+    }
+  }
+
+  function clearStoredFlow() {
+    try {
+      window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+      window.sessionStorage.removeItem(RETRY_STORAGE_KEY);
+    } catch (_error) {
+      // No hay estado durable que limpiar.
+    }
   }
 }());

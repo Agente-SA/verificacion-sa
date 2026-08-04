@@ -17,7 +17,9 @@ CREATE TABLE IF NOT EXISTS verification_tokens (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     status TEXT NOT NULL DEFAULT 'issued'
-        CHECK (status IN ('issued', 'used', 'expired', 'revoked')),
+        CHECK (
+            status IN ('issued', 'in_progress', 'used', 'expired', 'revoked')
+        ),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
     used_at TIMESTAMP WITH TIME ZONE,
@@ -25,12 +27,12 @@ CREATE TABLE IF NOT EXISTS verification_tokens (
 );
 CREATE INDEX IF NOT EXISTS verification_tokens_user_status_idx
     ON verification_tokens (guild_id, user_id, status);
-CREATE INDEX IF NOT EXISTS verification_tokens_expiration_idx
+CREATE INDEX IF NOT EXISTS verification_tokens_active_expiration_idx
     ON verification_tokens (expires_at)
-    WHERE status = 'issued';
-CREATE UNIQUE INDEX IF NOT EXISTS verification_tokens_one_issued_user_uidx
+    WHERE status IN ('issued', 'in_progress');
+CREATE UNIQUE INDEX IF NOT EXISTS verification_tokens_one_active_user_uidx
     ON verification_tokens (guild_id, user_id)
-    WHERE status = 'issued';
+    WHERE status IN ('issued', 'in_progress');
 
 CREATE TABLE IF NOT EXISTS verification_oauth_sessions (
     session_id UUID PRIMARY KEY,
@@ -191,6 +193,45 @@ CREATE INDEX IF NOT EXISTS verification_antifraud_expiration_idx
 
 
 MIGRATION_SQL = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname='verification_tokens_status_check'
+    ) THEN
+        ALTER TABLE verification_tokens
+        ADD CONSTRAINT verification_tokens_status_check
+        CHECK (
+            status IN (
+                'issued', 'in_progress', 'used', 'expired', 'revoked'
+            )
+        );
+    ELSIF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname='verification_tokens_status_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%in_progress%'
+    ) THEN
+        ALTER TABLE verification_tokens
+        DROP CONSTRAINT verification_tokens_status_check;
+        ALTER TABLE verification_tokens
+        ADD CONSTRAINT verification_tokens_status_check
+        CHECK (
+            status IN (
+                'issued', 'in_progress', 'used', 'expired', 'revoked'
+            )
+        );
+    END IF;
+END $$;
+DROP INDEX IF EXISTS verification_tokens_expiration_idx;
+CREATE INDEX IF NOT EXISTS verification_tokens_active_expiration_idx
+    ON verification_tokens (expires_at)
+    WHERE status IN ('issued', 'in_progress');
+DROP INDEX IF EXISTS verification_tokens_one_issued_user_uidx;
+CREATE UNIQUE INDEX IF NOT EXISTS verification_tokens_one_active_user_uidx
+    ON verification_tokens (guild_id, user_id)
+    WHERE status IN ('issued', 'in_progress');
 ALTER TABLE verification_attempts
     ADD COLUMN IF NOT EXISTS tor_detected BOOLEAN,
     ADD COLUMN IF NOT EXISTS datacenter_detected BOOLEAN,
@@ -463,7 +504,9 @@ async def create_verification_token(
                     WHEN expires_at <= CURRENT_TIMESTAMP THEN 'expired'
                     ELSE 'revoked'
                 END
-                WHERE guild_id=$1 AND user_id=$2 AND status='issued'
+                WHERE guild_id=$1
+                  AND user_id=$2
+                  AND status IN ('issued', 'in_progress')
                 """,
                 guild_id,
                 user_id,
@@ -490,11 +533,42 @@ async def revoke_verification_token(token_id, token_digest):
             """
             UPDATE verification_tokens
             SET status='revoked'
-            WHERE token_id=$1 AND token_digest=$2 AND status='issued'
+            WHERE token_id=$1
+              AND token_digest=$2
+              AND status IN ('issued', 'in_progress')
             RETURNING *
             """,
             token_id,
             token_digest,
+        )
+
+
+async def is_recoverable_verification_token(
+    token_id,
+    token_digest,
+    guild_id,
+    user_id,
+):
+    async with _pool().acquire() as conn:
+        return bool(
+            await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM verification_tokens
+                    WHERE token_id=$1
+                      AND token_digest=$2
+                      AND guild_id=$3
+                      AND user_id=$4
+                      AND status='in_progress'
+                      AND expires_at > CURRENT_TIMESTAMP
+                )
+                """,
+                token_id,
+                token_digest,
+                guild_id,
+                user_id,
+            )
         )
 
 
@@ -530,7 +604,7 @@ async def create_oauth_session(
                 SET status='expired'
                 WHERE token_id=$1
                   AND token_digest=$2
-                  AND status='issued'
+                  AND status IN ('issued', 'in_progress')
                   AND expires_at <= CURRENT_TIMESTAMP
                 """,
                 token_id,
@@ -538,13 +612,13 @@ async def create_oauth_session(
             )
             valid_token = await conn.fetchrow(
                 """
-                SELECT expires_at
+                SELECT status, expires_at
                 FROM verification_tokens
                 WHERE token_id=$1
                   AND token_digest=$2
                   AND guild_id=$3
                   AND user_id=$4
-                  AND status='issued'
+                  AND status IN ('issued', 'in_progress')
                   AND expires_at > CURRENT_TIMESTAMP
                 FOR UPDATE
                 """,
@@ -554,6 +628,32 @@ async def create_oauth_session(
                 expected_user_id,
             )
             if valid_token is None:
+                return None
+
+            flow_expires_at = (
+                expires_at
+                if valid_token["status"] == "issued"
+                else valid_token["expires_at"]
+            )
+            reserved_token = await conn.fetchrow(
+                """
+                UPDATE verification_tokens
+                SET status='in_progress', expires_at=$5
+                WHERE token_id=$1
+                  AND token_digest=$2
+                  AND guild_id=$3
+                  AND user_id=$4
+                  AND status IN ('issued', 'in_progress')
+                  AND expires_at > CURRENT_TIMESTAMP
+                RETURNING token_id
+                """,
+                token_id,
+                token_digest,
+                guild_id,
+                expected_user_id,
+                flow_expires_at,
+            )
+            if reserved_token is None:
                 return None
 
             await conn.execute(
@@ -575,7 +675,7 @@ async def create_oauth_session(
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9,
-                    LEAST($10::TIMESTAMPTZ, $11::TIMESTAMPTZ)
+                    $10::TIMESTAMPTZ
                 )
                 RETURNING *
                 """,
@@ -588,8 +688,7 @@ async def create_oauth_session(
                 initial_ip_hash,
                 initial_ip_network_hash,
                 hash_key_version,
-                expires_at,
-                valid_token["expires_at"],
+                flow_expires_at,
             )
 
 
@@ -618,7 +717,7 @@ async def claim_oauth_session(state_digest):
                   AND oauth.status='issued'
                   AND oauth.expires_at > CURRENT_TIMESTAMP
                   AND token.token_id=oauth.token_id
-                  AND token.status='issued'
+                  AND token.status IN ('issued', 'in_progress')
                   AND token.expires_at > CURRENT_TIMESTAMP
                 RETURNING oauth.*, token.token_digest,
                           token.expires_at AS token_expires_at
@@ -774,7 +873,7 @@ async def record_pending_verification_attempt(
                 SET status='expired'
                 WHERE token_id=$1
                   AND token_digest=$2
-                  AND status='issued'
+                  AND status IN ('issued', 'in_progress')
                   AND expires_at <= CURRENT_TIMESTAMP
                 """,
                 token_id,
@@ -788,7 +887,7 @@ async def record_pending_verification_attempt(
                   AND token_digest=$2
                   AND guild_id=$3
                   AND user_id=$4
-                  AND status='issued'
+                  AND status IN ('issued', 'in_progress')
                   AND expires_at > CURRENT_TIMESTAMP
                 RETURNING token_id
                 """,

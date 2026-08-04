@@ -1,7 +1,7 @@
 # Verificacion Super Sus SA
 
 Aplicacion independiente que contiene el bot de Discord, la API HTTP de
-verificacion y el frontend estatico publicado mediante GitHub Pages.
+verificacion y el frontend estatico servido por Guardian SUS en Square Cloud.
 
 ## Componentes
 
@@ -12,7 +12,8 @@ verificacion y el frontend estatico publicado mediante GitHub Pages.
 - `core/verification_security.py`: tokens HMAC y hashes de privacidad.
 - `core/verification_risk.py`: evaluacion de coincidencias y riesgo.
 - `core/vpn_detection.py`: consultas a proxycheck.io e ipapi.is.
-- `index.html`, `privacy.html` y `assets/`: frontend de GitHub Pages.
+- `index.html`, `privacy.html`, `terms.html` y `assets/`: frontend servido por
+  el mismo origen HTTPS de la API.
 
 ## Intents y permisos
 
@@ -73,6 +74,12 @@ El parámetro `state` se guarda en PostgreSQL mediante hash, caduca y solo puede
 consumirse una vez. Los access tokens OAuth de Discord se descartan después de
 consultar `/users/@me` y no se persisten.
 
+El enlace personal solo controla cuánto tiempo tiene el usuario para comenzar.
+Al iniciar, el token pasa a `in_progress` y obtiene una ventana OAuth completa e
+independiente. Los reintentos reutilizan esa reserva sin ampliar su vencimiento.
+`PUBLIC_VERIFICATION_URL` es opcional: si se omite, Guardian usa automáticamente
+el origen de `DISCORD_OAUTH_REDIRECT_URI`.
+
 `TRUSTED_PROXY_CIDRS` limita quien puede aportar `CF-Connecting-IP` y
 `CF-IPCountry`. El valor de ejemplo admite loopback y redes privadas usadas
 normalmente entre el proxy y la aplicacion. Si Square Cloud cambia esa ruta,
@@ -104,12 +111,11 @@ python -m unittest discover -s tests -v
 python bot.py
 ```
 
-## GitHub Pages
+## GitHub Pages opcional
 
-Publica la rama `main` desde la carpeta raiz. El token permanece en el
-fragmento `#token=...`, que no se envia a GitHub Pages.
-
-La URL publica de Square Cloud se configura en `assets/js/config.js`.
+GitHub Pages puede conservarse como copia pública de los documentos, pero los
+enlaces personales generados por el bot usan Square Cloud. El token permanece
+en el fragmento `#token=...`, que no se envía al servidor en la navegación.
 
 ## Square Cloud
 
@@ -122,7 +128,6 @@ La URL publica de Square Cloud se configura en `assets/js/config.js`.
    OAuth2 y usa exactamente esa misma URL en `DISCORD_OAUTH_REDIRECT_URI`.
 7. Conserva `HOST=0.0.0.0` y `PORT=80`.
 8. Despliega y comprueba `https://SUBDOMINIO.squareweb.app/health`.
-9. Actualiza `assets/js/config.js` con ese origen HTTPS y vuelve a publicar
-   GitHub Pages.
+9. Abre `https://SUBDOMINIO.squareweb.app/` y comprueba el frontend.
 
 El servicio no inicia si falta PostgreSQL, un secreto o una variable critica.

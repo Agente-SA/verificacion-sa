@@ -59,6 +59,18 @@ OAUTH_STATE_EXPIRATION_MINUTES = max(
 )
 
 
+def _public_verification_url() -> str:
+    configured_url = os.getenv("PUBLIC_VERIFICATION_URL", "").strip().rstrip("/")
+    if configured_url:
+        return configured_url
+    parsed_redirect = urlsplit(DISCORD_OAUTH_REDIRECT_URI)
+    if parsed_redirect.scheme and parsed_redirect.netloc:
+        return urlunsplit(
+            (parsed_redirect.scheme, parsed_redirect.netloc, "", "", "")
+        )
+    return ""
+
+
 def _normalize_database_url(raw_url: str) -> str:
     database_url = raw_url.strip()
     if database_url.startswith("postgres://"):
@@ -88,7 +100,8 @@ REGIONAL_REVIEW_ROLE_IDS = frozenset({
 })
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
-TOKEN_EXPIRATION_MINUTES = max(1, _env_int("TOKEN_EXPIRATION_MINUTES", 10))
+VERIFICATION_PUBLIC_URL = _public_verification_url()
+TOKEN_EXPIRATION_MINUTES = max(1, _env_int("TOKEN_EXPIRATION_MINUTES", 15))
 DATA_RETENTION_DAYS = max(1, _env_int("DATA_RETENTION_DAYS", 90))
 ANTIFRAUD_RETENTION_DAYS = max(1, _env_int("ANTIFRAUD_RETENTION_DAYS", 400))
 TOKEN_SECRET = os.getenv("TOKEN_SECRET", "").strip()
@@ -125,6 +138,7 @@ def get_configuration_errors() -> tuple[str, ...]:
         "STAFF_CHANNEL_ID": STAFF_CHANNEL_ID,
         "VERIFICATION_TICKET_CHANNEL_ID": VERIFICATION_TICKET_CHANNEL_ID,
         "FRONTEND_URL": FRONTEND_URL,
+        "VERIFICATION_PUBLIC_URL": VERIFICATION_PUBLIC_URL,
         "TOKEN_SECRET": TOKEN_SECRET,
         "IP_HASH_SECRET": IP_HASH_SECRET,
     }
@@ -134,6 +148,16 @@ def get_configuration_errors() -> tuple[str, ...]:
         parsed_frontend = urlsplit(FRONTEND_URL)
         if parsed_frontend.scheme != "https" or not parsed_frontend.netloc:
             errors.append("FRONTEND_URL debe usar HTTPS")
+    if VERIFICATION_PUBLIC_URL:
+        parsed_public = urlsplit(VERIFICATION_PUBLIC_URL)
+        if parsed_public.scheme != "https" or not parsed_public.netloc:
+            errors.append("PUBLIC_VERIFICATION_URL debe usar HTTPS")
+        if parsed_public.path not in ("", "/"):
+            errors.append("PUBLIC_VERIFICATION_URL no debe contener una ruta")
+        if parsed_public.fragment or parsed_public.query:
+            errors.append(
+                "PUBLIC_VERIFICATION_URL no debe contener query ni fragmento"
+            )
     if DISCORD_OAUTH_REDIRECT_URI:
         parsed_redirect = urlsplit(DISCORD_OAUTH_REDIRECT_URI)
         if parsed_redirect.scheme != "https" or not parsed_redirect.netloc:

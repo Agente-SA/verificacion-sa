@@ -16,6 +16,7 @@ from core import database
 from core.config import (
     API_HOST,
     API_PORT,
+    BASE_DIR,
     DATA_RETENTION_DAYS,
     DISCORD_CLIENT_ID,
     DISCORD_CLIENT_SECRET,
@@ -30,9 +31,11 @@ from core.config import (
     STAFF_ROLE_IDS,
     TRUSTED_PROXY_NETWORKS,
     VERIFIED_ROLE_ID,
+    VERIFICATION_PUBLIC_URL,
 )
 from core.verification_risk import RiskAssessment, assess_verification_risk
 from core.verification_security import (
+    ExpiredVerificationToken,
     InvalidVerificationToken,
     VerificationConfigurationError,
     hash_ip_address,
@@ -49,7 +52,7 @@ from core.vpn_detection import VPNCheckResult, check_vpn_services
 
 logger = logging.getLogger(__name__)
 API_NAME = "verification-sa-api"
-API_VERSION = 5
+API_VERSION = 6
 MAX_REQUEST_SIZE = 64 * 1024
 RATE_WINDOW = timedelta(minutes=15)
 USER_SUBMISSION_LIMIT = 5
@@ -85,20 +88,43 @@ class RoleGrantError(RuntimeError):
         self.diagnostics = diagnostics
 
 
-def _frontend_origin() -> str:
-    parsed = urlsplit(FRONTEND_URL)
+def _url_origin(url: str) -> str:
+    parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.netloc:
-        raise ValueError("FRONTEND_URL debe ser una direccion HTTPS valida.")
+        raise ValueError("La URL publica debe ser una direccion HTTPS valida.")
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def _apply_security_headers(response: web.StreamResponse) -> None:
-    response.headers.setdefault("Cache-Control", "no-store")
+def _frontend_origins() -> frozenset[str]:
+    return frozenset(
+        _url_origin(url)
+        for url in (VERIFICATION_PUBLIC_URL, FRONTEND_URL)
+        if url
+    )
+
+
+def _apply_security_headers(
+    response: web.StreamResponse,
+    *,
+    web_content: bool = False,
+    cache_assets: bool = False,
+) -> None:
+    response.headers.setdefault(
+        "Cache-Control",
+        "public, max-age=3600" if cache_assets else "no-store",
+    )
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+        (
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; connect-src 'self'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'"
+            if web_content
+            else "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+        ),
     )
 
 
@@ -152,7 +178,7 @@ def _oauth_result_url(result: str) -> str:
         "rejected",
         "retry",
     } else "retry"
-    return f"{FRONTEND_URL}/#result={safe_result}"
+    return f"{VERIFICATION_PUBLIC_URL}/#result={safe_result}"
 
 
 def _oauth_redirect(result: str) -> web.HTTPFound:
@@ -865,8 +891,14 @@ async def _send_success_alert(bot, member: discord.Member) -> None:
 
 
 def create_verification_app(bot) -> web.Application:
-    allowed_origin = _frontend_origin()
+    allowed_origins = _frontend_origins()
     configured_guild_id = GUILD_ID
+    web_documents = {
+        "/": BASE_DIR / "index.html",
+        "/index.html": BASE_DIR / "index.html",
+        "/privacy.html": BASE_DIR / "privacy.html",
+        "/terms.html": BASE_DIR / "terms.html",
+    }
 
     @web.middleware
     async def request_security(
@@ -874,7 +906,8 @@ def create_verification_app(bot) -> web.Application:
         handler,
     ) -> web.StreamResponse:
         origin = request.headers.get("Origin")
-        if origin and origin != allowed_origin:
+        is_api_request = request.path.startswith("/api/")
+        if is_api_request and origin and origin not in allowed_origins:
             response = _error_response("origin_not_allowed", 403)
             _apply_security_headers(response)
             response.headers["Vary"] = "Origin"
@@ -885,14 +918,26 @@ def create_verification_app(bot) -> web.Application:
         except web.HTTPException as http_error:
             response = http_error
 
-        _apply_security_headers(response)
-        response.headers["Vary"] = "Origin"
-        if origin == allowed_origin:
-            response.headers["Access-Control-Allow-Origin"] = allowed_origin
+        is_web_content = (
+            request.path in web_documents
+            or request.path.startswith("/assets/")
+        )
+        _apply_security_headers(
+            response,
+            web_content=is_web_content,
+            cache_assets=request.path.startswith("/assets/"),
+        )
+        if is_api_request:
+            response.headers["Vary"] = "Origin"
+        if is_api_request and origin in allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type"
             response.headers["Access-Control-Max-Age"] = "600"
         return response
+
+    async def web_document(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(web_documents[request.path])
 
     async def health(_request: web.Request) -> web.Response:
         discord_ready = bot.is_ready()
@@ -1274,10 +1319,27 @@ def create_verification_app(bot) -> web.Application:
         try:
             request_payload = await request.json(loads=json.loads)
             supplied_token, signals = _parse_submission(request_payload)
-            verification_token = validate_signed_verification_token(
-                supplied_token,
-                expected_guild_id=configured_guild_id,
-            )
+            try:
+                verification_token = validate_signed_verification_token(
+                    supplied_token,
+                    expected_guild_id=configured_guild_id,
+                )
+            except ExpiredVerificationToken:
+                verification_token = validate_signed_verification_token(
+                    supplied_token,
+                    expected_guild_id=configured_guild_id,
+                    allow_expired=True,
+                )
+                recoverable = (
+                    await database.is_recoverable_verification_token(
+                        verification_token.token_id,
+                        token_digest(supplied_token),
+                        verification_token.guild_id,
+                        verification_token.user_id,
+                    )
+                )
+                if not recoverable:
+                    return _error_response("invalid_or_expired_link", 400)
             client_ip = _client_ip(request)
             ip_hash = hash_ip_address(client_ip)
             ip_hashes = hash_ip_address_candidates(client_ip)
@@ -1288,6 +1350,9 @@ def create_verification_app(bot) -> web.Application:
             return _error_response("invalid_or_expired_link", 400)
         except VerificationConfigurationError:
             logger.exception("Configuracion criptografica de verificacion invalida.")
+            return _error_response("temporarily_unavailable", 503)
+        except Exception:
+            logger.exception("No se pudo validar la reserva del enlace OAuth.")
             return _error_response("temporarily_unavailable", 503)
 
         try:
@@ -1372,6 +1437,13 @@ def create_verification_app(bot) -> web.Application:
             return _error_response("temporarily_unavailable", 503)
         if oauth_session is None:
             return _error_response("invalid_or_expired_link", 400)
+
+        logger.info(
+            "Sesion OAuth preparada | usuario=%s | sesion=%s | vence=%s",
+            verification_token.user_id,
+            oauth_session["session_id"],
+            oauth_session["expires_at"],
+        )
 
         return web.json_response(
             {
@@ -1478,6 +1550,13 @@ def create_verification_app(bot) -> web.Application:
     app.router.add_post("/api/oauth/start", start_oauth)
     app.router.add_get("/oauth/callback", oauth_callback)
     app.router.add_route("OPTIONS", "/{path:.*}", options)
+    for path in web_documents:
+        app.router.add_get(path, web_document)
+    app.router.add_static(
+        "/assets/",
+        path=BASE_DIR / "assets",
+        show_index=False,
+    )
     return app
 
 

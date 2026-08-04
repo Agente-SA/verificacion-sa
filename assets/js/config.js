@@ -1,5 +1,8 @@
+const guardianOrigin = window.location.hostname === "agente-sa.github.io"
+  ? "https://guardian-sus-verificacion-api.squareweb.app"
+  : window.location.origin;
+
 window.VERIFICATION_CONFIG = Object.freeze({
-  // API publica de Verificacion SA desplegada en Square Cloud.
-  apiBaseUrl: "https://guardian-sus-verificacion-api.squareweb.app",
+  apiBaseUrl: guardianOrigin,
   requestTimeoutMs: 30000
 });

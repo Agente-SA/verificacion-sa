@@ -10,11 +10,11 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from core.config import (
-    FRONTEND_URL,
     IP_HASH_SECRET,
     IP_HASH_SECRET_PREVIOUS,
     TOKEN_EXPIRATION_MINUTES,
     TOKEN_SECRET,
+    VERIFICATION_PUBLIC_URL,
 )
 
 
@@ -212,11 +212,11 @@ def hash_limited_fingerprint_candidates(
 
 
 def build_verification_url(token: str) -> str:
-    if not FRONTEND_URL.startswith("https://"):
+    if not VERIFICATION_PUBLIC_URL.startswith("https://"):
         raise VerificationConfigurationError(
-            "FRONTEND_URL debe ser una direccion HTTPS valida."
+            "La URL publica de verificacion debe ser HTTPS."
         )
-    return f"{FRONTEND_URL}/#token={quote(token, safe='')}"
+    return f"{VERIFICATION_PUBLIC_URL}/#token={quote(token, safe='')}"
 
 
 def create_signed_verification_token(
@@ -272,6 +272,7 @@ def validate_signed_verification_token(
     now: datetime | None = None,
     expected_guild_id: int | None = None,
     expected_user_id: int | None = None,
+    allow_expired: bool = False,
 ) -> VerificationTokenPayload:
     if (
         not isinstance(token, str)
@@ -320,7 +321,7 @@ def validate_signed_verification_token(
         raise InvalidVerificationToken("Periodo de token invalido.")
     if issued_at > current + timedelta(seconds=CLOCK_SKEW_SECONDS):
         raise InvalidVerificationToken("Fecha de emision futura.")
-    if current >= expires_at:
+    if current >= expires_at and not allow_expired:
         raise ExpiredVerificationToken("El token ha expirado.")
     if expected_guild_id is not None and guild_id != expected_guild_id:
         raise InvalidVerificationToken("Servidor de token invalido.")

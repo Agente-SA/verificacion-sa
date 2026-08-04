@@ -3,11 +3,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
+from aiohttp.test_utils import TestClient, TestServer
+
 try:
     from api.verification_api import (
         RoleGrantError,
+        create_verification_app,
         _discord_authorization_url,
         _force_regional_manual_review,
+        _frontend_origins,
         _load_oauth_signals,
         _member_regional_review_role_ids,
         _oauth_result_url,
@@ -58,13 +62,36 @@ class OAuthFlowTests(unittest.TestCase):
 
     def test_result_url_keeps_status_in_fragment(self):
         with patch(
-            "api.verification_api.FRONTEND_URL",
-            "https://example.github.io/verification",
+            "api.verification_api.VERIFICATION_PUBLIC_URL",
+            "https://guardian.example",
         ):
             result_url = _oauth_result_url("received")
         parsed = urlsplit(result_url)
         self.assertEqual(parsed.query, "")
         self.assertEqual(parsed.fragment, "result=received")
+
+    def test_public_and_legacy_frontends_are_allowed_during_migration(self):
+        with (
+            patch(
+                "api.verification_api.VERIFICATION_PUBLIC_URL",
+                "https://guardian.example",
+            ),
+            patch(
+                "api.verification_api.FRONTEND_URL",
+                "https://example.github.io/verification",
+            ),
+        ):
+            origins = _frontend_origins()
+
+        self.assertEqual(
+            origins,
+            frozenset(
+                {
+                    "https://guardian.example",
+                    "https://example.github.io",
+                }
+            ),
+        )
 
     def test_postgres_json_text_is_restored_as_oauth_signals(self):
         signals = _load_oauth_signals(
@@ -86,6 +113,31 @@ class ServiceReadinessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(ready)
         bot.wait_until_ready.assert_awaited_once_with()
+
+
+class StaticWebServingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_guardian_serves_frontend_and_assets_from_its_origin(self):
+        bot = SimpleNamespace(is_ready=lambda: True)
+        client = TestClient(TestServer(create_verification_app(bot)))
+        await client.start_server()
+        try:
+            index_response = await client.get("/")
+            index_body = await index_response.text()
+            asset_response = await client.get("/assets/js/app.js")
+
+            self.assertEqual(index_response.status, 200)
+            self.assertIn("Verifica tu cuenta", index_body)
+            self.assertIn(
+                "connect-src 'self'",
+                index_response.headers["Content-Security-Policy"],
+            )
+            self.assertEqual(asset_response.status, 200)
+            self.assertEqual(
+                asset_response.headers["Cache-Control"],
+                "public, max-age=3600",
+            )
+        finally:
+            await client.close()
 
 
 class RoleDeliveryTests(unittest.IsolatedAsyncioTestCase):
