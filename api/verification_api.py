@@ -52,7 +52,7 @@ from core.vpn_detection import VPNCheckResult, check_vpn_services
 
 logger = logging.getLogger(__name__)
 API_NAME = "verification-sa-api"
-API_VERSION = 6
+API_VERSION = 7
 MAX_REQUEST_SIZE = 64 * 1024
 RATE_WINDOW = timedelta(minutes=15)
 USER_SUBMISSION_LIMIT = 5
@@ -170,6 +170,46 @@ def _discord_authorization_url(state: str) -> str:
         }
     )
     return f"{DISCORD_AUTHORIZE_URL}?{query}"
+
+
+async def prepare_direct_oauth_authorization(
+    *,
+    token_id,
+    verification_token_digest: str,
+    guild_id: int,
+    user_id: int,
+) -> dict:
+    """Reserve a one-use OAuth session without requiring the web form first."""
+    state = secrets.token_urlsafe(32)
+    current_time = datetime.now(timezone.utc)
+    oauth_session = await database.create_oauth_session(
+        session_id=uuid4(),
+        state_digest=_oauth_state_digest(state),
+        token_id=token_id,
+        token_digest=verification_token_digest,
+        guild_id=guild_id,
+        expected_user_id=user_id,
+        signals={
+            "flow_mode": "direct_oauth",
+            "signal_version": 1,
+        },
+        initial_ip_hash=None,
+        initial_ip_network_hash=None,
+        hash_key_version=IP_HASH_SECRET_VERSION,
+        expires_at=(
+            current_time
+            + timedelta(minutes=OAUTH_STATE_EXPIRATION_MINUTES)
+        ),
+    )
+    if oauth_session is None:
+        raise InvalidVerificationToken(
+            "El token directo ya no esta disponible."
+        )
+    return {
+        "authorization_url": _discord_authorization_url(state),
+        "session_id": oauth_session["session_id"],
+        "expires_at": oauth_session["expires_at"],
+    }
 
 
 def _oauth_result_url(result: str) -> str:
@@ -353,6 +393,108 @@ def _os_family(user_agent: str) -> str:
     if "linux" in lowered:
         return "Linux"
     return "Other"
+
+
+def _direct_device_class(user_agent: str) -> str:
+    lowered = user_agent.lower()
+    if any(
+        marker in lowered
+        for marker in ("ipad", "tablet", "kindle", "silk/")
+    ):
+        return "tablet"
+    if any(
+        marker in lowered
+        for marker in ("iphone", "ipod", "mobile", "android")
+    ):
+        return "phone"
+    return "desktop"
+
+
+def _safe_request_header(
+    request: web.Request,
+    name: str,
+    max_length: int,
+    fallback: str,
+) -> str:
+    value = request.headers.get(name, "").strip()
+    if (
+        not value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return fallback
+    return value[:max_length]
+
+
+def _authenticated_signal_context(
+    request: web.Request,
+    signals: dict,
+) -> dict:
+    if signals.get("flow_mode") == "direct_oauth":
+        user_agent = _safe_request_header(
+            request,
+            "User-Agent",
+            512,
+            "Unknown",
+        )
+        raw_language = _safe_request_header(
+            request,
+            "Accept-Language",
+            128,
+            "unknown",
+        )
+        language = raw_language.split(",", 1)[0].split(";", 1)[0].strip()
+        if not language:
+            language = "unknown"
+        browser_family = _browser_family(user_agent)
+        os_family = _os_family(user_agent)
+        device_class = _direct_device_class(user_agent)
+        return {
+            "fingerprint_hash": None,
+            "fingerprint_hashes": (),
+            "timezone_name": None,
+            "language": language[:32],
+            "browser_family": browser_family,
+            "os_family": os_family,
+            "device_class": device_class,
+            "stored_signals": {
+                "flow_mode": "direct_oauth",
+                "signal_version": 1,
+                "platform": os_family,
+                "mobile": device_class != "desktop",
+                "touch_support": None,
+            },
+        }
+
+    browser_family = _browser_family(signals["user_agent"])
+    os_family = _os_family(signals["user_agent"])
+    fingerprint_basis = {
+        "version": signals["signal_version"],
+        "language": signals["language"].lower(),
+        "timezone": signals["timezone"],
+        "browser_family": browser_family,
+        "os_family": os_family,
+        "platform": signals["platform"],
+        "mobile": signals["mobile"],
+        "device_class": signals["device_class"],
+        "touch_support": signals["touch_support"],
+    }
+    return {
+        "fingerprint_hash": hash_limited_fingerprint(fingerprint_basis),
+        "fingerprint_hashes": hash_limited_fingerprint_candidates(
+            fingerprint_basis
+        ),
+        "timezone_name": signals["timezone"],
+        "language": signals["language"],
+        "browser_family": browser_family,
+        "os_family": os_family,
+        "device_class": signals["device_class"],
+        "stored_signals": {
+            "signal_version": signals["signal_version"],
+            "platform": signals["platform"],
+            "mobile": signals["mobile"],
+            "touch_support": signals["touch_support"],
+        },
+    }
 
 
 def _parse_ip(value: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -1007,23 +1149,9 @@ def create_verification_app(bot) -> web.Application:
             ip_hashes = hash_ip_address_candidates(client_ip)
             ip_network_hash = hash_ip_network(client_ip)
             ip_network_hashes = hash_ip_network_candidates(client_ip)
-            browser_family = _browser_family(signals["user_agent"])
-            os_family = _os_family(signals["user_agent"])
-            fingerprint_basis = {
-                "version": signals["signal_version"],
-                "language": signals["language"].lower(),
-                "timezone": signals["timezone"],
-                "browser_family": browser_family,
-                "os_family": os_family,
-                "platform": signals["platform"],
-                "mobile": signals["mobile"],
-                "device_class": signals["device_class"],
-                "touch_support": signals["touch_support"],
-            }
-            fingerprint_hash = hash_limited_fingerprint(fingerprint_basis)
-            fingerprint_hashes = hash_limited_fingerprint_candidates(
-                fingerprint_basis
-            )
+            signal_context = _authenticated_signal_context(request, signals)
+            fingerprint_hash = signal_context["fingerprint_hash"]
+            fingerprint_hashes = signal_context["fingerprint_hashes"]
             country_code = _country_code(request)
         except (InvalidSubmission, VerificationConfigurationError):
             return _error_response("temporarily_unavailable", 503)
@@ -1063,16 +1191,13 @@ def create_verification_app(bot) -> web.Application:
                     fingerprint_hash=fingerprint_hash,
                     country_code=country_code,
                     region=None,
-                    timezone_name=signals["timezone"],
-                    language=signals["language"],
-                    browser_family=browser_family,
-                    os_family=os_family,
-                    device_type=signals["device_class"],
+                    timezone_name=signal_context["timezone_name"],
+                    language=signal_context["language"],
+                    browser_family=signal_context["browser_family"],
+                    os_family=signal_context["os_family"],
+                    device_type=signal_context["device_class"],
                     signals={
-                        "signal_version": signals["signal_version"],
-                        "platform": signals["platform"],
-                        "mobile": signals["mobile"],
-                        "touch_support": signals["touch_support"],
+                        **signal_context["stored_signals"],
                         "regional_review_role_ids": list(
                             regional_review_role_ids
                         ),

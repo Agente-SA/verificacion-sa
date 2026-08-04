@@ -8,6 +8,7 @@ from aiohttp.test_utils import TestClient, TestServer
 try:
     from api.verification_api import (
         RoleGrantError,
+        _authenticated_signal_context,
         create_verification_app,
         _discord_authorization_url,
         _force_regional_manual_review,
@@ -18,6 +19,7 @@ try:
         _oauth_state_digest,
         _remove_legacy_verified_role,
         _wait_for_guardian_ready,
+        prepare_direct_oauth_authorization,
     )
     from core.verification_risk import RiskAssessment
     from modules.verificacion import (
@@ -101,6 +103,73 @@ class OAuthFlowTests(unittest.TestCase):
         self.assertEqual(signals["signal_version"], 1)
 
 
+class DirectOAuthFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_session_has_no_untrusted_initial_ip(self):
+        oauth_session = {
+            "session_id": "direct-session",
+            "expires_at": "later",
+        }
+        create_session = AsyncMock(return_value=oauth_session)
+        with (
+            patch(
+                "api.verification_api.database.create_oauth_session",
+                create_session,
+            ),
+            patch("api.verification_api.DISCORD_CLIENT_ID", 123456789),
+            patch(
+                "api.verification_api.DISCORD_OAUTH_REDIRECT_URI",
+                "https://guardian.example/oauth/callback",
+            ),
+        ):
+            prepared = await prepare_direct_oauth_authorization(
+                token_id="token-id",
+                verification_token_digest="a" * 64,
+                guild_id=1,
+                user_id=2,
+            )
+
+        call = create_session.await_args.kwargs
+        self.assertIsNone(call["initial_ip_hash"])
+        self.assertIsNone(call["initial_ip_network_hash"])
+        self.assertEqual(call["signals"]["flow_mode"], "direct_oauth")
+        self.assertEqual(prepared["session_id"], "direct-session")
+        parsed = urlsplit(prepared["authorization_url"])
+        self.assertEqual(parsed.netloc, "discord.com")
+        self.assertTrue(parse_qs(parsed.query)["state"][0])
+        self.assertNotEqual(
+            parse_qs(parsed.query)["state"][0],
+            call["state_digest"],
+        )
+
+    async def test_direct_callback_uses_headers_without_js_fingerprint(self):
+        request = SimpleNamespace(
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 14; Mobile) "
+                    "AppleWebKit/537.36 Chrome/125.0 Safari/537.36"
+                ),
+                "Accept-Language": "es-CO,es;q=0.9",
+            }
+        )
+
+        context = _authenticated_signal_context(
+            request,
+            {"flow_mode": "direct_oauth", "signal_version": 1},
+        )
+
+        self.assertIsNone(context["fingerprint_hash"])
+        self.assertEqual(context["fingerprint_hashes"], ())
+        self.assertIsNone(context["timezone_name"])
+        self.assertEqual(context["language"], "es-CO")
+        self.assertEqual(context["browser_family"], "Chrome")
+        self.assertEqual(context["os_family"], "Android")
+        self.assertEqual(context["device_class"], "phone")
+        self.assertEqual(
+            context["stored_signals"]["flow_mode"],
+            "direct_oauth",
+        )
+
+
 class ServiceReadinessTests(unittest.IsolatedAsyncioTestCase):
     async def test_transient_gateway_reconnect_gets_a_grace_window(self):
         bot = SimpleNamespace(
@@ -141,6 +210,24 @@ class StaticWebServingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RoleDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_result_is_sent_as_a_normal_dm_message(self):
+        followup = SimpleNamespace(send=AsyncMock())
+        interaction = SimpleNamespace(guild=None, followup=followup)
+        manager = VerificationManager(SimpleNamespace())
+        manager.remember_result_interaction("token-id", 2, interaction)
+
+        delivered = await manager.send_verification_result(
+            "token-id",
+            2,
+            "approved",
+        )
+
+        self.assertTrue(delivered)
+        followup.send.assert_awaited_once_with(
+            "Tu cuenta ha sido Verificada con Éxito ✅",
+            ephemeral=False,
+        )
+
     async def test_legacy_role_is_removed_when_present(self):
         legacy_role = SimpleNamespace(id=1409401827065204786)
         member = SimpleNamespace(

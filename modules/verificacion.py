@@ -6,13 +6,16 @@ from datetime import datetime, timezone
 
 import discord
 
+from api.verification_api import prepare_direct_oauth_authorization
 from core import database
 from core.config import (
     DB_NO_DISPONIBLE,
     GUILD_ID,
+    OAUTH_STATE_EXPIRATION_MINUTES,
     REGIONAL_REVIEW_ROLE_IDS,
     STAFF_ROLE_IDS,
     TOKEN_EXPIRATION_MINUTES,
+    VERIFICATION_PUBLIC_URL,
     VERIFICATION_TICKET_CHANNEL_ID,
     VERIFIED_ROLE_ID,
     get_configuration_errors,
@@ -81,6 +84,98 @@ class PersonalVerificationLinkView(discord.ui.View):
                 url=verification_url,
             )
         )
+
+
+class DirectOAuthLinkView(discord.ui.View):
+    def __init__(self, authorization_url: str):
+        super().__init__(timeout=OAUTH_STATE_EXPIRATION_MINUTES * 60)
+        self.add_item(
+            discord.ui.Button(
+                label="Continuar con Discord",
+                style=discord.ButtonStyle.link,
+                url=authorization_url,
+            )
+        )
+
+
+class DirectVerificationConsentView(discord.ui.View):
+    def __init__(
+        self,
+        manager: "VerificationManager",
+        target_id: int,
+    ):
+        super().__init__(timeout=TOKEN_EXPIRATION_MINUTES * 60)
+        self.manager = manager
+        self.target_id = target_id
+        self._operation_lock = asyncio.Lock()
+        self._completed = False
+        self.add_item(
+            discord.ui.Button(
+                label="Privacidad",
+                style=discord.ButtonStyle.link,
+                url=f"{VERIFICATION_PUBLIC_URL}/privacy.html",
+            )
+        )
+        self.add_item(
+            discord.ui.Button(
+                label="Términos",
+                style=discord.ButtonStyle.link,
+                url=f"{VERIFICATION_PUBLIC_URL}/terms.html",
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.target_id:
+            return True
+        await interaction.response.send_message(
+            "Esta solicitud pertenece a otro usuario.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Aceptar e iniciar",
+        style=discord.ButtonStyle.success,
+    )
+    async def accept(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ):
+        async with self._operation_lock:
+            if self._completed:
+                await interaction.response.send_message(
+                    "Esta solicitud ya fue procesada.",
+                    ephemeral=True,
+                )
+                return
+            self._completed = True
+            await self.manager.issue_direct_oauth_link(interaction)
+            self.stop()
+
+    @discord.ui.button(
+        label="Cancelar",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ):
+        async with self._operation_lock:
+            if self._completed:
+                await interaction.response.send_message(
+                    "Esta solicitud ya fue procesada.",
+                    ephemeral=True,
+                )
+                return
+            self._completed = True
+            await interaction.response.edit_message(
+                content="Solicitud de verificación cancelada.",
+                embed=None,
+                view=None,
+            )
+            self.stop()
 
 
 class VerificationPanelView(discord.ui.View):
@@ -399,7 +494,10 @@ class VerificationManager:
                 f"<#{VERIFICATION_TICKET_CHANNEL_ID}> y selecciona la **Opción 1**."
             )
 
-        await pending[1].followup.send(content, ephemeral=True)
+        await pending[1].followup.send(
+            content,
+            ephemeral=pending[1].guild is not None,
+        )
         return True
 
     def manual_review_view(self, attempt_id: int) -> ManualReviewView:
@@ -855,6 +953,141 @@ class VerificationManager:
         )
         return embed
 
+    @staticmethod
+    def direct_consent_embed() -> discord.Embed:
+        embed = discord.Embed(
+            title="Solicitud de Verificación Directa",
+            description=(
+                "El equipo del servidor te ha enviado una alternativa privada "
+                "para completar la verificación de eventos.\n\n"
+                "Al continuar, Discord confirmará qué cuenta está usando el "
+                "enlace y Guardian aplicará las comprobaciones habituales de "
+                "seguridad. Lee la **Privacidad** y los **Términos** antes de "
+                "aceptar."
+            ),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(
+            text="La solicitud es personal, temporal y solo puede utilizarse una vez."
+        )
+        return embed
+
+    async def issue_direct_oauth_link(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        await interaction.response.defer()
+        user_id = interaction.user.id
+
+        if get_configuration_errors() or database.bot_pool is None:
+            await interaction.edit_original_response(
+                content="La verificación no está disponible temporalmente.",
+                embed=None,
+                view=None,
+            )
+            return
+
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None:
+            await interaction.edit_original_response(
+                content="No fue posible localizar el servidor configurado.",
+                embed=None,
+                view=None,
+            )
+            return
+
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+        if member is None or member.bot:
+            await interaction.edit_original_response(
+                content="Tu cuenta ya no está disponible dentro del servidor.",
+                embed=None,
+                view=None,
+            )
+            return
+        if member.get_role(VERIFIED_ROLE_ID) is not None:
+            await interaction.edit_original_response(
+                content="Tu cuenta ya está verificada en el servidor.",
+                embed=None,
+                view=None,
+            )
+            return
+
+        lock = self._issue_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            issued = None
+            try:
+                issued = create_signed_verification_token(GUILD_ID, user_id)
+                await database.create_verification_token(
+                    issued.payload.token_id,
+                    issued.digest,
+                    issued.payload.guild_id,
+                    issued.payload.user_id,
+                    issued.payload.expires_at,
+                )
+                direct_oauth = await prepare_direct_oauth_authorization(
+                    token_id=issued.payload.token_id,
+                    verification_token_digest=issued.digest,
+                    guild_id=issued.payload.guild_id,
+                    user_id=issued.payload.user_id,
+                )
+            except Exception:
+                if issued is not None:
+                    try:
+                        await database.revoke_verification_token(
+                            issued.payload.token_id,
+                            issued.digest,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "No se pudo revocar el enlace directo incompleto de %s.",
+                            user_id,
+                        )
+                logger.exception(
+                    "No se pudo preparar la verificacion directa de %s.",
+                    user_id,
+                )
+                await interaction.edit_original_response(
+                    content=(
+                        "No fue posible generar el acceso directo. Solicita al "
+                        "staff que lo intente nuevamente más tarde."
+                    ),
+                    embed=None,
+                    view=None,
+                )
+                return
+
+            self._last_issued_at[user_id] = asyncio.get_running_loop().time()
+            embed = discord.Embed(
+                title="Verificación Directa Preparada",
+                description=(
+                    "Presiona **Continuar con Discord** y autoriza únicamente "
+                    "el acceso básico `identify`. Después se aplicará el mismo "
+                    "análisis de seguridad de la verificación normal."
+                ),
+                color=discord.Color.green(),
+            )
+            embed.set_footer(
+                text=(
+                    "El enlace caduca pronto y queda inutilizado después de "
+                    "su primer uso."
+                )
+            )
+            await interaction.edit_original_response(
+                content=None,
+                embed=embed,
+                view=DirectOAuthLinkView(direct_oauth["authorization_url"]),
+            )
+            self.remember_result_interaction(
+                issued.payload.token_id,
+                user_id,
+                interaction,
+            )
+
     async def issue_personal_link(self, interaction: discord.Interaction):
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
@@ -1017,6 +1250,88 @@ def setup(bot):
 
         await interaction.followup.send(
             f"Panel permanente de verificación publicado en {canal.mention}.",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(
+        name="verificacion_directa",
+        description="(Staff) Envía una verificación alternativa por DM.",
+    )
+    @require_staff()
+    @discord.app_commands.describe(
+        usuario="Miembro que recibirá la solicitud privada de verificación.",
+    )
+    async def verificacion_directa(
+        interaction: discord.Interaction,
+        usuario: discord.Member,
+    ):
+        if interaction.guild is None or interaction.guild.id != GUILD_ID:
+            await interaction.response.send_message(
+                "Este comando solo está disponible en el servidor configurado.",
+                ephemeral=True,
+            )
+            return
+        if get_configuration_errors():
+            await interaction.response.send_message(
+                "La verificación no está disponible temporalmente.",
+                ephemeral=True,
+            )
+            return
+        if database.bot_pool is None:
+            await interaction.response.send_message(
+                DB_NO_DISPONIBLE,
+                ephemeral=True,
+            )
+            return
+        if usuario.bot:
+            await interaction.response.send_message(
+                "No se puede verificar una cuenta de bot.",
+                ephemeral=True,
+            )
+            return
+        if usuario.get_role(VERIFIED_ROLE_ID) is not None:
+            await interaction.response.send_message(
+                f"{usuario.mention} ya posee el rol de verificación.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await usuario.send(
+                embed=verification.direct_consent_embed(),
+                view=DirectVerificationConsentView(
+                    verification,
+                    usuario.id,
+                ),
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                (
+                    f"No pude enviar un DM a {usuario.mention}. El miembro debe "
+                    "permitir mensajes directos de integrantes del servidor."
+                ),
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            logger.exception(
+                "No se pudo enviar la verificacion directa a %s.",
+                usuario.id,
+            )
+            await interaction.followup.send(
+                "Discord no permitió enviar la solicitud en este momento.",
+                ephemeral=True,
+            )
+            return
+
+        logger.info(
+            "Verificacion directa enviada | staff=%s | usuario=%s",
+            interaction.user.id,
+            usuario.id,
+        )
+        await interaction.followup.send(
+            f"Solicitud de verificación directa enviada por DM a {usuario.mention}.",
             ephemeral=True,
         )
 

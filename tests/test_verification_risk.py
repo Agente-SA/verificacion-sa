@@ -51,7 +51,7 @@ class VerificationRiskTests(unittest.TestCase):
 
         result = assess_verification_risk(attempt(), [candidate], now=NOW)
 
-        self.assertEqual(result.score, 15)
+        self.assertEqual(result.score, 5)
         self.assertNotIn(
             "Pais coincidente junto a la conexion de red",
             result.reasons,
@@ -75,7 +75,7 @@ class VerificationRiskTests(unittest.TestCase):
             result.reasons,
         )
 
-    def test_age_signals_can_raise_existing_suspicion_to_review(self):
+    def test_fingerprint_match_does_not_receive_recency_bonus(self):
         candidate = attempt(
             user_id=2,
             ip_hash="different-ip",
@@ -92,8 +92,35 @@ class VerificationRiskTests(unittest.TestCase):
             server_joined_at=NOW - timedelta(days=5),
         )
 
-        self.assertEqual(result.score, 40)
+        self.assertEqual(result.score, 15)
+        self.assertEqual(result.decision, "approved")
+        self.assertNotIn(
+            "Coincidencia de red registrada en las ultimas 24 horas",
+            result.reasons,
+        )
+
+    def test_network_match_receives_recency_bonus(self):
+        candidate = attempt(
+            user_id=2,
+            ip_hash="different-ip",
+            ip_network_hash="network-current",
+            fingerprint_hash="different-fingerprint",
+            country_code="AR",
+            timezone=None,
+            browser_family=None,
+            os_family=None,
+            device_type=None,
+            created_at=NOW - timedelta(hours=2),
+        )
+
+        result = assess_verification_risk(attempt(), [candidate], now=NOW)
+
+        self.assertEqual(result.score, 35)
         self.assertEqual(result.decision, "review")
+        self.assertIn(
+            "Coincidencia de red registrada en las ultimas 24 horas",
+            result.reasons,
+        )
 
     def test_exact_ip_within_thirty_days_still_forces_review(self):
         candidate = attempt(
@@ -138,7 +165,7 @@ class VerificationRiskTests(unittest.TestCase):
 
         result = assess_verification_risk(attempt(), [candidate], now=NOW)
 
-        self.assertEqual(result.score, 60)
+        self.assertEqual(result.score, 50)
         self.assertEqual(result.decision, "review")
         self.assertEqual(result.possible_main_user_id, 2)
 
@@ -215,7 +242,7 @@ class VerificationRiskTests(unittest.TestCase):
 
         result = assess_verification_risk(attempt(), [candidate], now=NOW)
 
-        self.assertEqual(result.score, 85)
+        self.assertEqual(result.score, 75)
         self.assertEqual(result.decision, "rejected")
 
     def test_versioned_hash_match_flags_are_honored(self):
@@ -231,8 +258,8 @@ class VerificationRiskTests(unittest.TestCase):
 
         result = assess_verification_risk(attempt(), [candidate], now=NOW)
 
-        self.assertEqual(result.score, 70)
-        self.assertEqual(result.decision, "rejected")
+        self.assertEqual(result.score, 60)
+        self.assertEqual(result.decision, "review")
 
 
 if __name__ == "__main__":

@@ -74,6 +74,14 @@ El parámetro `state` se guarda en PostgreSQL mediante hash, caduca y solo puede
 consumirse una vez. Los access tokens OAuth de Discord se descartan después de
 consultar `/users/@me` y no se persisten.
 
+`/verificacion_directa usuario:@Miembro` permite al staff enviar por DM una
+solicitud alternativa con consentimiento. Al aceptarla, el miembro recibe un
+enlace OAuth2 de un solo uso sin depender del formulario inicial. El callback
+conserva las comprobaciones de red, VPN, antigüedad, roles e historial, pero no
+genera la huella JavaScript que solo existe en el flujo web normal. Si el
+miembro tiene los mensajes directos cerrados, el comando informa el problema al
+staff y no crea ningún token.
+
 El enlace personal solo controla cuánto tiempo tiene el usuario para comenzar.
 Al iniciar, el token pasa a `in_progress` y obtiene una ventana OAuth completa e
 independiente. Los reintentos reutilizan esa reserva sin ampliar su vencimiento.

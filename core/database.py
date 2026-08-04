@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS verification_oauth_sessions (
             )
         ),
     signals JSONB NOT NULL DEFAULT '{}'::jsonb,
-    initial_ip_hash CHAR(64) NOT NULL,
+    initial_ip_hash CHAR(64),
     initial_ip_network_hash CHAR(64),
     hash_key_version INTEGER NOT NULL DEFAULT 1,
     oauth_user_id BIGINT,
@@ -232,6 +232,8 @@ DROP INDEX IF EXISTS verification_tokens_one_issued_user_uidx;
 CREATE UNIQUE INDEX IF NOT EXISTS verification_tokens_one_active_user_uidx
     ON verification_tokens (guild_id, user_id)
     WHERE status IN ('issued', 'in_progress');
+ALTER TABLE verification_oauth_sessions
+    ALTER COLUMN initial_ip_hash DROP NOT NULL;
 ALTER TABLE verification_attempts
     ADD COLUMN IF NOT EXISTS tor_detected BOOLEAN,
     ADD COLUMN IF NOT EXISTS datacenter_detected BOOLEAN,

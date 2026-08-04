@@ -16,7 +16,7 @@ COUNTRY_NETWORK_MATCH_SCORE = 10
 VPN_SINGLE_PROVIDER_SCORE = REVIEW_THRESHOLD
 VPN_MULTIPLE_PROVIDER_SCORE = REJECTION_THRESHOLD
 VPN_PARTIAL_CHECK_SCORE = 5
-FINGERPRINT_MATCH_SCORE = 15
+FINGERPRINT_MATCH_SCORE = 5
 VPN_SIGNAL_LABELS = {
     "vpn": "VPN",
     "proxy": "proxy",
@@ -227,12 +227,17 @@ def assess_verification_risk(
 
         created_at = _utc_datetime(_value(candidate, "created_at"))
         age = max(timedelta(0), current_time - created_at)
-        if age <= RECENT_WINDOW:
-            score += 15
-            reasons.append("Coincidencia registrada en las ultimas 24 horas")
-        elif age <= RELATED_WINDOW:
-            score += 8
-            reasons.append("Coincidencia registrada en los ultimos 7 dias")
+        if exact_ip or same_network:
+            if age <= RECENT_WINDOW:
+                score += 15
+                reasons.append(
+                    "Coincidencia de red registrada en las ultimas 24 horas"
+                )
+            elif age <= RELATED_WINDOW:
+                score += 8
+                reasons.append(
+                    "Coincidencia de red registrada en los ultimos 7 dias"
+                )
 
         if exact_ip and age <= EXACT_IP_REVIEW_WINDOW:
             score = max(score, REVIEW_THRESHOLD)
