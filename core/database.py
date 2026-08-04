@@ -674,9 +674,11 @@ async def get_oauth_start_counts(
             SELECT
                 COUNT(*) FILTER (
                     WHERE expected_user_id=$2
+                      AND status NOT IN ('superseded', 'error', 'expired')
                 ) AS user_count,
-                COUNT(*) FILTER (
+                COUNT(DISTINCT expected_user_id) FILTER (
                     WHERE initial_ip_hash::TEXT=ANY($3::TEXT[])
+                      AND status NOT IN ('superseded', 'error', 'expired')
                 ) AS ip_count
             FROM verification_oauth_sessions
             WHERE guild_id=$1 AND created_at >= $4

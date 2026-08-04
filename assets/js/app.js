@@ -2,6 +2,8 @@
   "use strict";
 
   const config = window.VERIFICATION_CONFIG || {};
+  const MAX_START_ATTEMPTS = 2;
+  const START_RETRY_DELAY_MS = 1800;
   const verificationPanel = document.getElementById("verification-panel");
   const successPanel = document.getElementById("success-panel");
   const consentInput = document.getElementById("privacy-consent");
@@ -101,11 +103,58 @@
 
     setLoading(true);
     showStatus("Enviando tu solicitud de forma segura...");
+    const signals = collectLimitedSignals();
 
+    try {
+      for (let attempt = 1; attempt <= MAX_START_ATTEMPTS; attempt += 1) {
+        try {
+          const result = await requestOAuthStart(
+            apiBaseUrl,
+            token,
+            signals
+          );
+
+          if (
+            result.status === "completed" &&
+            isSafeResultUrl(result.result_url)
+          ) {
+            window.location.replace(result.result_url);
+            return;
+          }
+          if (!isDiscordAuthorizationUrl(result.authorization_url)) {
+            const invalidUrlError = new Error(
+              "invalid_oauth_authorization_url"
+            );
+            invalidUrlError.code = "invalid_oauth_authorization_url";
+            throw invalidUrlError;
+          }
+
+          window.history.replaceState(null, "", window.location.pathname);
+          window.location.assign(result.authorization_url);
+          return;
+        } catch (error) {
+          if (!isRetriableStartError(error) || attempt === MAX_START_ATTEMPTS) {
+            throw error;
+          }
+          showStatus(
+            "La conexión está tardando más de lo habitual. " +
+            "Realizaremos un segundo intento automáticamente..."
+          );
+          await delay(START_RETRY_DELAY_MS);
+        }
+      }
+    } catch (error) {
+      showStartError(error);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function requestOAuthStart(apiBaseUrl, token, signals) {
     const controller = new AbortController();
     const timeout = window.setTimeout(
       () => controller.abort(),
-      Number(config.requestTimeoutMs) || 15000
+      Number(config.requestTimeoutMs) || 30000
     );
 
     try {
@@ -122,33 +171,71 @@
         body: JSON.stringify({
           token,
           consent: true,
-          signals: collectLimitedSignals()
+          signals
         }),
         signal: controller.signal
       });
-
-      if (!response.ok) throw new Error("verification_request_failed");
-      const result = await response.json();
-
-      if (result.status === "completed" && isSafeResultUrl(result.result_url)) {
-        window.location.replace(result.result_url);
-        return;
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const requestError = new Error(
+          result.code || "verification_request_failed"
+        );
+        requestError.code = result.code || "verification_request_failed";
+        requestError.status = response.status;
+        throw requestError;
       }
-      if (!isDiscordAuthorizationUrl(result.authorization_url)) {
-        throw new Error("invalid_oauth_authorization_url");
-      }
-
-      window.history.replaceState(null, "", window.location.pathname);
-      window.location.assign(result.authorization_url);
-    } catch (error) {
-      showStatus(
-        "No pudimos completar la solicitud en este momento. Regresa a Discord, " +
-        "genera un enlace nuevo e inténtalo otra vez."
-      );
+      return result;
     } finally {
       window.clearTimeout(timeout);
-      setLoading(false);
     }
+  }
+
+  function isRetriableStartError(error) {
+    return error?.name === "AbortError" ||
+      error instanceof TypeError ||
+      error?.code === "temporarily_unavailable" ||
+      Number(error?.status) >= 500;
+  }
+
+  function showStartError(error) {
+    if (error?.code === "invalid_or_expired_link") {
+      showStatus(
+        "Este enlace ya venció o fue utilizado. Regresa a Discord y genera " +
+        "uno nuevo."
+      );
+      return;
+    }
+    if (error?.code === "too_many_requests") {
+      showStatus(
+        "Hay varias solicitudes recientes desde esta conexión. Espera unos " +
+        "minutos y vuelve a presionar el botón; no necesitas generar otro " +
+        "enlace mientras este siga vigente."
+      );
+      return;
+    }
+    if (error?.code === "membership_required") {
+      showStatus(
+        "No pudimos confirmar tu membresía en el servidor. Regresa a Discord " +
+        "y comprueba que continúas dentro de la comunidad."
+      );
+      return;
+    }
+    if (error?.code === "invalid_request") {
+      showStatus(
+        "No pudimos validar los datos de esta solicitud. Regresa a Discord y " +
+        "genera un enlace nuevo."
+      );
+      return;
+    }
+    showStatus(
+      "El servicio está tardando más de lo habitual. Espera unos segundos y " +
+      "vuelve a presionar Iniciar verificación; puedes conservar este enlace " +
+      "mientras no haya vencido."
+    );
+  }
+
+  function delay(milliseconds) {
+    return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
   }
 
   function isDiscordAuthorizationUrl(value) {

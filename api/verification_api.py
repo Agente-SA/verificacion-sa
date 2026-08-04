@@ -48,11 +48,11 @@ from core.vpn_detection import VPNCheckResult, check_vpn_services
 
 logger = logging.getLogger(__name__)
 API_NAME = "verification-sa-api"
-API_VERSION = 3
+API_VERSION = 4
 MAX_REQUEST_SIZE = 64 * 1024
 RATE_WINDOW = timedelta(minutes=15)
 USER_SUBMISSION_LIMIT = 5
-IP_SUBMISSION_LIMIT = 30
+IP_SUBMISSION_LIMIT = 60
 SUBMISSION_KEYS = frozenset({"token", "consent", "signals"})
 SIGNAL_KEYS = frozenset({
     "signalVersion",
@@ -1308,6 +1308,15 @@ def create_verification_app(bot) -> web.Application:
                 user_count >= USER_SUBMISSION_LIMIT
                 or ip_count >= IP_SUBMISSION_LIMIT
             ):
+                logger.warning(
+                    (
+                        "Inicio OAuth limitado | usuario=%s | usuario_intentos=%s "
+                        "| usuarios_ip=%s"
+                    ),
+                    verification_token.user_id,
+                    user_count,
+                    ip_count,
+                )
                 return _error_response("too_many_requests", 429)
 
             state = secrets.token_urlsafe(32)
