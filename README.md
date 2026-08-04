@@ -43,9 +43,10 @@ La URL de Neon puede copiarse completa. La aplicacion retira automaticamente
 conserva `sslmode=require`.
 
 `STAFF_ROLE_IDS` acepta uno o varios IDs separados por comas. Esos roles
-pueden resolver revisiones manuales y usar `/metricas`; el propietario del
-servidor tambien conserva acceso. Para que Discord muestre la mencion en una
-revision, al menos uno de esos roles debe ser mencionable por el bot.
+pueden resolver revisiones manuales y usar `/metricas`, `/user_guardian` y
+`/verificacion_directa`; el propietario del servidor tambien conserva acceso.
+Para que Discord muestre la mencion en una revision, al menos uno de esos roles
+debe ser mencionable por el bot.
 
 Los secretos se generan por separado:
 
@@ -80,7 +81,8 @@ enlace OAuth2 de un solo uso sin depender del formulario inicial. El callback
 conserva las comprobaciones de red, VPN, antigüedad, roles e historial, pero no
 genera la huella JavaScript que solo existe en el flujo web normal. Si el
 miembro tiene los mensajes directos cerrados, el comando informa el problema al
-staff y no crea ningún token.
+staff y no crea ningún token. Todos los intentos directos se envían a revisión
+manual, independientemente del puntaje calculado.
 
 El enlace personal solo controla cuánto tiempo tiene el usuario para comenzar.
 Al iniciar, el token pasa a `in_progress` y obtiene una ventana OAuth completa e
@@ -108,6 +110,10 @@ solo se completa cuando Discord confirma el rol. Un reconciliador se ejecuta
 al arrancar y cada minuto para recuperar interrupciones. `/metricas` consulta
 los resultados del mes UTC que aun se encuentran dentro de la retencion
 detallada.
+
+`/user_guardian usuario:@Miembro` muestra de forma efímera el último intento
+detallado conservado: decisión, puntaje, país aproximado, motivos, proveedores,
+flujo y resolución. La consulta no expone IP ni hashes de red.
 
 ## Desarrollo local
 

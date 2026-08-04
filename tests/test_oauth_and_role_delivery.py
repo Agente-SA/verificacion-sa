@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlsplit
@@ -11,6 +12,7 @@ try:
         _authenticated_signal_context,
         create_verification_app,
         _discord_authorization_url,
+        _force_direct_manual_review,
         _force_regional_manual_review,
         _frontend_origins,
         _load_oauth_signals,
@@ -25,6 +27,7 @@ try:
     from modules.verificacion import (
         VerificationManager,
         _attempt_regional_review_role_ids,
+        _stored_vpn_summary,
     )
 except ModuleNotFoundError as exc:
     raise unittest.SkipTest(
@@ -352,6 +355,30 @@ class RoleDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RegionalReviewTests(unittest.IsolatedAsyncioTestCase):
+    def test_direct_flow_always_requires_manual_review(self):
+        for original_decision in ("approved", "rejected"):
+            with self.subTest(original_decision=original_decision):
+                assessment = RiskAssessment(
+                    score=5 if original_decision == "approved" else 90,
+                    level="low" if original_decision == "approved" else "high",
+                    decision=original_decision,
+                    possible_main_user_id=(
+                        None if original_decision == "approved" else 999
+                    ),
+                    reasons=("Evaluación original",),
+                    related_user_count=0,
+                )
+
+                forced = _force_direct_manual_review(assessment, True)
+
+                self.assertEqual(forced.decision, "review")
+                self.assertEqual(forced.score, assessment.score)
+                self.assertEqual(forced.level, assessment.level)
+                self.assertIn(
+                    "Verificacion directa solicitada por el staff",
+                    forced.reasons,
+                )
+
     def test_member_filter_roles_are_detected_and_sorted(self):
         member = SimpleNamespace(
             roles=[
@@ -415,6 +442,65 @@ class RegionalReviewTests(unittest.IsolatedAsyncioTestCase):
         member.send.assert_awaited_once_with(
             "Região incorreta. Verificação recusada."
         )
+
+
+class GuardianUserQueryTests(unittest.TestCase):
+    def test_stored_provider_results_are_rendered_for_staff(self):
+        summary = _stored_vpn_summary(
+            {
+                "proxycheck.io": {
+                    "available": True,
+                    "detected": False,
+                    "checks": {"vpn": False},
+                    "risk_score": 3,
+                    "confidence_score": 100,
+                    "last_seen": None,
+                    "network_type": "Business",
+                    "network_provider": "Example Telecom",
+                },
+                "ipapi.is": {
+                    "available": False,
+                    "detected": False,
+                },
+            },
+            datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIn("**proxycheck.io**", summary)
+        self.assertIn("VPN `No`", summary)
+        self.assertIn("Confianza `100/100`", summary)
+        self.assertIn("Proveedor: `Example Telecom`", summary)
+        self.assertIn("**ipapi.is**", summary)
+        self.assertIn("Servicio sin respuesta", summary)
+
+    def test_user_guardian_embed_marks_direct_review_and_resolution(self):
+        row = {
+            "id": 29,
+            "country_code": "BR",
+            "risk_score": 45,
+            "risk_level": "medium",
+            "decision": "review",
+            "role_granted": False,
+            "role_delivery_status": "not_required",
+            "possible_main_user_id": 999,
+            "manual_review_status": "accepted",
+            "reviewed_by": 123,
+            "reviewed_at": datetime(2026, 8, 4, 12, 5, tzinfo=timezone.utc),
+            "risk_reasons": ["Rango de red coincidente"],
+            "vpn_provider_results": {},
+            "vpn_checked_at": None,
+            "signals": {"flow_mode": "direct_oauth"},
+            "created_at": datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc),
+        }
+        member = SimpleNamespace(id=2, mention="<@2>")
+
+        embed = VerificationManager.user_guardian_embed(member, row)
+        fields = {field.name: field.value for field in embed.fields}
+
+        self.assertEqual(fields["Flujo"], "Verificación directa por DM")
+        self.assertIn("Rango de red coincidente", fields["Coincidencias"])
+        self.assertIn("**ACEPTADA** por <@123>", fields["Resolución"])
+        self.assertEqual(fields["Verificación interna"], "`29`")
 
 
 if __name__ == "__main__":

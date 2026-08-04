@@ -52,7 +52,7 @@ from core.vpn_detection import VPNCheckResult, check_vpn_services
 
 logger = logging.getLogger(__name__)
 API_NAME = "verification-sa-api"
-API_VERSION = 7
+API_VERSION = 8
 MAX_REQUEST_SIZE = 64 * 1024
 RATE_WINDOW = timedelta(minutes=15)
 USER_SUBMISSION_LIMIT = 5
@@ -351,6 +351,23 @@ def _force_regional_manual_review(
     if not role_ids:
         return assessment
     reason = "Rol regional sujeto a revisión manual obligatoria"
+    return RiskAssessment(
+        score=assessment.score,
+        level=assessment.level,
+        decision="review",
+        possible_main_user_id=assessment.possible_main_user_id,
+        reasons=tuple(dict.fromkeys((*assessment.reasons, reason))),
+        related_user_count=assessment.related_user_count,
+    )
+
+
+def _force_direct_manual_review(
+    assessment: RiskAssessment,
+    direct_flow: bool,
+) -> RiskAssessment:
+    if not direct_flow:
+        return assessment
+    reason = "Verificacion directa solicitada por el staff"
     return RiskAssessment(
         score=assessment.score,
         level=assessment.level,
@@ -1111,6 +1128,7 @@ def create_verification_app(bot) -> web.Application:
         guild_id = int(oauth_session["guild_id"])
         user_id = int(oauth_session["expected_user_id"])
         supplied_digest = str(oauth_session["token_digest"])
+        direct_review_required = signals.get("flow_mode") == "direct_oauth"
 
         try:
             member = await _get_member(
@@ -1219,6 +1237,7 @@ def create_verification_app(bot) -> web.Application:
                 if (
                     vpn_check.available_count == 0
                     and not regional_review_role_ids
+                    and not direct_review_required
                 ):
                     await database.finalize_verification_attempt(
                         attempt["id"],
@@ -1258,6 +1277,10 @@ def create_verification_app(bot) -> web.Application:
                     assessment = _force_regional_manual_review(
                         assessment,
                         regional_review_role_ids,
+                    )
+                    assessment = _force_direct_manual_review(
+                        assessment,
+                        direct_review_required,
                     )
                     logger.info(
                         (
@@ -1325,7 +1348,11 @@ def create_verification_app(bot) -> web.Application:
         if attempt is None:
             return _error_response("temporarily_unavailable", 503)
 
-        if vpn_check.available_count == 0 and not regional_review_role_ids:
+        if (
+            vpn_check.available_count == 0
+            and not regional_review_role_ids
+            and not direct_review_required
+        ):
             await _send_private_result(
                 bot,
                 token_id,

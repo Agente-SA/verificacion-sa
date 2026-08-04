@@ -1640,6 +1640,42 @@ async def get_verified_users_count(guild_id):
         )
 
 
+async def get_latest_verification_attempt(guild_id, user_id):
+    async with _pool().acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT
+                id,
+                guild_id,
+                user_id,
+                discord_tag,
+                country_code,
+                risk_score,
+                risk_level,
+                decision,
+                role_granted,
+                role_delivery_status,
+                possible_main_user_id,
+                manual_review_required,
+                manual_review_status,
+                reviewed_by,
+                reviewed_at,
+                risk_reasons,
+                vpn_check_status,
+                vpn_provider_results,
+                vpn_checked_at,
+                signals,
+                created_at
+            FROM verification_attempts
+            WHERE guild_id=$1 AND user_id=$2
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            guild_id,
+            user_id,
+        )
+
+
 async def get_verified_users_page(guild_id, limit, offset):
     async with _pool().acquire() as conn:
         return await conn.fetch(

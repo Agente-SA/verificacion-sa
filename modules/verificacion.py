@@ -74,6 +74,108 @@ def _format_country(country_code: str | None) -> str:
     return f"{flag} {code}"
 
 
+def _json_value(value, default):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value
+
+
+def _stored_provider_timestamp(value) -> str:
+    if not isinstance(value, str) or not value:
+        return "No proporcionada"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value[:64]
+    return _discord_timestamp(parsed, "f")
+
+
+def _stored_vpn_summary(provider_results, checked_at=None) -> str:
+    provider_results = _json_value(provider_results, {})
+    if not isinstance(provider_results, dict) or not provider_results:
+        return "No hay resultados de proveedores conservados."
+
+    preferred_order = ("proxycheck.io", "ipapi.is")
+    provider_names = [
+        *preferred_order,
+        *sorted(
+            name
+            for name in provider_results
+            if name not in preferred_order
+        ),
+    ]
+    lines = []
+    detected_count = 0
+    available_count = 0
+    for provider_name in provider_names:
+        details = provider_results.get(provider_name)
+        if not isinstance(details, dict):
+            continue
+        lines.append(f"**{provider_name}**")
+        if details.get("available") is not True:
+            lines.append("Servicio sin respuesta")
+            continue
+
+        available_count += 1
+        detected = details.get("detected") is True
+        detected_count += int(detected)
+        checks = details.get("checks")
+        checks = checks if isinstance(checks, dict) else {}
+        vpn_state = checks.get("vpn")
+        if vpn_state is None:
+            vpn_state = detected
+        vpn_label = "Sí" if vpn_state is True else "No" if vpn_state is False else "N/D"
+        lines.append(f"VPN `{vpn_label}`")
+
+        risk = details.get("risk_score")
+        confidence = details.get("confidence_score")
+        risk_label = f"{risk}/100" if type(risk) is int else "N/D"
+        confidence_label = (
+            f"{confidence}/100" if type(confidence) is int else "N/D"
+        )
+        lines.append(
+            f"Riesgo `{risk_label}` · Confianza `{confidence_label}`"
+        )
+        lines.append(
+            "Última detección: "
+            f"{_stored_provider_timestamp(details.get('last_seen'))}"
+        )
+
+        context = []
+        for label, key in (
+            ("Servicio", "service"),
+            ("Red", "network_type"),
+            ("Proveedor", "network_provider"),
+        ):
+            value = details.get(key)
+            if isinstance(value, str) and value.strip():
+                context.append(f"{label}: `{value.strip()[:120]}`")
+        if context:
+            lines.append(" · ".join(context))
+
+    if detected_count >= 2:
+        lines.append("**Coincidencia de proveedores:** Sí")
+    elif detected_count == 1:
+        lines.append("**Señal aislada:** Revisión manual")
+    elif available_count == 0:
+        lines.append("**Estado:** Servicios no disponibles")
+    else:
+        lines.append("**Coincidencia de proveedores:** No detectada")
+    if checked_at is not None:
+        lines.append(f"Comprobación: {_discord_timestamp(checked_at, 'f')}")
+    return "\n".join(lines)[:1024]
+
+
+def _attempt_flow_label(signals) -> str:
+    signals = _json_value(signals, {})
+    if isinstance(signals, dict) and signals.get("flow_mode") == "direct_oauth":
+        return "Verificación directa por DM"
+    return "Panel web"
+
+
 class PersonalVerificationLinkView(discord.ui.View):
     def __init__(self, verification_url: str):
         super().__init__(timeout=TOKEN_EXPIRATION_MINUTES * 60)
@@ -859,6 +961,141 @@ class VerificationManager:
         for token_id in user_tokens:
             self._pending_result_interactions.pop(token_id, None)
 
+    @staticmethod
+    def user_guardian_embed(
+        member: discord.Member,
+        row,
+    ) -> discord.Embed:
+        decision_labels = {
+            "pending": "Pendiente",
+            "approved": "Aprobada",
+            "review": "En revisión manual",
+            "rejected": "Rechazada",
+            "error": "Error técnico",
+        }
+        role_labels = {
+            "not_required": "No requerido",
+            "approved_pending_role": "Pendiente de entrega",
+            "processing": "Procesando",
+            "granted": "Entregado",
+            "failed": "En reintento",
+        }
+        decision = str(row["decision"] or "pending")
+        risk_level = str(row["risk_level"] or "pending").upper()
+        role_status = role_labels.get(
+            str(row["role_delivery_status"] or "not_required"),
+            "Desconocido",
+        )
+        if row["role_granted"]:
+            role_status = "Entregado"
+
+        reasons = _json_value(row["risk_reasons"], [])
+        if not isinstance(reasons, (list, tuple)):
+            reasons = []
+        reasons_text = "\n".join(
+            f"- {str(reason)[:240]}" for reason in reasons
+        )
+
+        possible_main_user_id = row["possible_main_user_id"]
+        possible_main = (
+            f"<@{possible_main_user_id}> (`{possible_main_user_id}`)"
+            if possible_main_user_id
+            else "No detectada"
+        )
+        manual_status = str(row["manual_review_status"] or "not_required")
+        reviewer_id = row["reviewed_by"]
+        reviewed_at = row["reviewed_at"]
+        if manual_status == "accepted":
+            resolution = (
+                f"**ACEPTADA** por <@{reviewer_id}> (`{reviewer_id}`)"
+                if reviewer_id
+                else "**ACEPTADA** por el staff"
+            )
+        elif manual_status == "rejected":
+            resolution = (
+                f"**RECHAZADA** por <@{reviewer_id}> (`{reviewer_id}`)"
+                if reviewer_id
+                else "**RECHAZADA** por el staff"
+            )
+        elif manual_status == "pending":
+            resolution = "Pendiente de decisión del staff"
+        elif manual_status == "processing":
+            resolution = "Siendo procesada por un miembro del staff"
+        else:
+            resolution = "Resolución automática"
+        if reviewed_at is not None:
+            resolution += f"\n{_discord_timestamp(reviewed_at, 'f')}"
+
+        embed = discord.Embed(
+            title="Consulta de Usuario - Guardian SUS",
+            description=f"{member.mention} (`{member.id}`)",
+            color=(
+                discord.Color.green()
+                if decision == "approved"
+                else discord.Color.red()
+                if decision == "rejected"
+                else discord.Color.orange()
+            ),
+            timestamp=row["created_at"],
+        )
+        embed.add_field(
+            name="Estado",
+            value=decision_labels.get(decision, decision),
+            inline=True,
+        )
+        embed.add_field(
+            name="Riesgo",
+            value=f"{risk_level} ({row['risk_score']}/100)",
+            inline=True,
+        )
+        embed.add_field(
+            name="País detectado",
+            value=_format_country(row["country_code"]),
+            inline=True,
+        )
+        embed.add_field(
+            name="Flujo",
+            value=_attempt_flow_label(row["signals"]),
+            inline=True,
+        )
+        embed.add_field(
+            name="Rol verificado",
+            value=role_status,
+            inline=True,
+        )
+        embed.add_field(
+            name="Posible cuenta principal",
+            value=possible_main,
+            inline=True,
+        )
+        embed.add_field(
+            name="Coincidencias",
+            value=reasons_text[:1024] or "Sin motivos detallados",
+            inline=False,
+        )
+        embed.add_field(
+            name="Análisis de red por proveedor",
+            value=_stored_vpn_summary(
+                row["vpn_provider_results"],
+                row["vpn_checked_at"],
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Verificación interna",
+            value=f"`{row['id']}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Resolución",
+            value=resolution,
+            inline=False,
+        )
+        embed.set_footer(
+            text="Se muestra el último intento detallado conservado."
+        )
+        return embed
+
     async def verified_users_embed(
         self,
         guild: discord.Guild,
@@ -1380,6 +1617,63 @@ def setup(bot):
                 0,
                 total,
             ),
+            ephemeral=True,
+        )
+
+    @bot.tree.command(
+        name="user_guardian",
+        description="(Staff) Consulta el último análisis de un miembro.",
+    )
+    @require_staff()
+    @discord.app_commands.describe(
+        usuario="Miembro cuyo último análisis será consultado.",
+    )
+    async def user_guardian(
+        interaction: discord.Interaction,
+        usuario: discord.Member,
+    ):
+        if interaction.guild is None or interaction.guild.id != GUILD_ID:
+            await interaction.response.send_message(
+                "Este comando solo está disponible en el servidor configurado.",
+                ephemeral=True,
+            )
+            return
+        if database.bot_pool is None:
+            await interaction.response.send_message(
+                DB_NO_DISPONIBLE,
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            row = await database.get_latest_verification_attempt(
+                interaction.guild.id,
+                usuario.id,
+            )
+        except Exception:
+            logger.exception(
+                "No se pudo consultar el historial Guardian de %s.",
+                usuario.id,
+            )
+            await interaction.followup.send(
+                "No fue posible consultar la información en este momento.",
+                ephemeral=True,
+            )
+            return
+
+        if row is None:
+            await interaction.followup.send(
+                (
+                    f"No existe un intento detallado conservado para "
+                    f"{usuario.mention}."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            embed=verification.user_guardian_embed(usuario, row),
             ephemeral=True,
         )
 
