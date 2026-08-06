@@ -239,6 +239,18 @@ def _attempt_flow_label(signals) -> str:
     return "Panel web"
 
 
+def _is_forced_manual_attempt(row) -> bool:
+    try:
+        signals = row["signals"]
+    except (KeyError, TypeError):
+        return False
+    signals = _json_value(signals, {})
+    return (
+        isinstance(signals, dict)
+        and signals.get("flow_mode") == "forced_manual"
+    )
+
+
 def _attempt_manual_provider(signals) -> str | None:
     signals = _json_value(signals, {})
     if not isinstance(signals, dict):
@@ -724,9 +736,13 @@ class VerificationManager:
             )
             if not delivered:
                 try:
-                    await member.send(
-                        "Tu cuenta ha sido Verificada con Éxito ✅"
+                    message = (
+                        "✅ Tu verificación se ha realizado con éxito "
+                        "de manera forzada."
+                        if _is_forced_manual_attempt(row)
+                        else "Tu cuenta ha sido Verificada con Éxito ✅"
                     )
+                    await member.send(message)
                     delivered = True
                 except (discord.Forbidden, discord.HTTPException):
                     logger.info(

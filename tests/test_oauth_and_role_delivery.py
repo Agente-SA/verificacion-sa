@@ -236,6 +236,35 @@ class RoleDeliveryTests(unittest.IsolatedAsyncioTestCase):
             ephemeral=False,
         )
 
+    async def test_forced_verification_sends_its_own_success_dm(self):
+        row = {
+            "id": 42,
+            "token_id": None,
+            "user_id": 2,
+            "signals": {"flow_mode": "forced_manual"},
+            "user_notified_at": None,
+            "staff_notified_at": object(),
+        }
+        member = SimpleNamespace(id=2, send=AsyncMock())
+        manager = VerificationManager(SimpleNamespace())
+
+        with (
+            patch(
+                "api.verification_api._send_private_result",
+                AsyncMock(return_value=False),
+            ),
+            patch(
+                "core.database.mark_role_notification",
+                AsyncMock(),
+            ) as mark_notification,
+        ):
+            await manager._notify_completed_role_delivery(row, member)
+
+        member.send.assert_awaited_once_with(
+            "✅ Tu verificación se ha realizado con éxito de manera forzada."
+        )
+        mark_notification.assert_awaited_once_with(42, "user")
+
     async def test_review_dm_uses_a_plain_role_label(self):
         followup = SimpleNamespace(send=AsyncMock())
         interaction = SimpleNamespace(guild=None, followup=followup)
