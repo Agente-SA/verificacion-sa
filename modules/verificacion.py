@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 
@@ -10,7 +10,9 @@ from api.verification_api import prepare_direct_oauth_authorization
 from core import database
 from core.config import (
     DB_NO_DISPONIBLE,
+    DATA_RETENTION_DAYS,
     GUILD_ID,
+    LEGACY_VERIFIED_ROLE_ID,
     OAUTH_STATE_EXPIRATION_MINUTES,
     REGIONAL_REVIEW_ROLE_IDS,
     STAFF_ROLE_IDS,
@@ -29,6 +31,7 @@ logger = logging.getLogger(__name__)
 ISSUE_COOLDOWN_SECONDS = 15
 RESULT_INTERACTION_LIFETIME_SECONDS = TOKEN_EXPIRATION_MINUTES * 60
 VERIFIED_USERS_PER_PAGE = 10
+VERIFIED_ROLE_DISPLAY = "**@Verificado-ES**"
 
 
 def _attempt_regional_review_role_ids(row) -> tuple[int, ...]:
@@ -72,6 +75,63 @@ def _format_country(country_code: str | None) -> str:
         return "No disponible"
     flag = "".join(chr(127397 + ord(character)) for character in code)
     return f"{flag} {code}"
+
+
+def _normalize_country_code(value: str) -> str:
+    code = (value or "").strip().upper()
+    if len(code) != 2 or not code.isascii() or not code.isalpha():
+        raise ValueError("El país debe ser un código ISO de dos letras.")
+    return code
+
+
+def _normalize_provider(value: str) -> str:
+    provider = " ".join((value or "").split())
+    if not 2 <= len(provider) <= 100:
+        raise ValueError("El proveedor debe contener entre 2 y 100 caracteres.")
+    return provider
+
+
+def _forced_discord_observations(
+    member: discord.Member,
+    *,
+    now: datetime | None = None,
+) -> tuple[list[str], dict]:
+    current_time = now or datetime.now(timezone.utc)
+    reasons = [
+        "Verificación forzada por staff; análisis de red no realizado."
+    ]
+    account_created_at = member.created_at.astimezone(timezone.utc)
+    joined_at = member.joined_at
+    if joined_at is not None:
+        joined_at = joined_at.astimezone(timezone.utc)
+
+    if current_time - account_created_at < timedelta(days=30):
+        reasons.append("Cuenta de Discord creada hace menos de 30 días.")
+    if joined_at is not None and current_time - joined_at < timedelta(days=30):
+        reasons.append("Ingreso al servidor hace menos de 30 días.")
+
+    regional_role_ids = sorted(
+        role.id
+        for role in member.roles
+        if role.id in REGIONAL_REVIEW_ROLE_IDS
+    )
+    if regional_role_ids:
+        reasons.append(
+            "Roles regionales detectados por Discord: "
+            + ", ".join(str(role_id) for role_id in regional_role_ids)
+            + "."
+        )
+
+    signals = {
+        "account_created_at": account_created_at.isoformat(),
+        "server_joined_at": joined_at.isoformat() if joined_at else None,
+        "discord_role_ids": sorted(role.id for role in member.roles),
+        "regional_review_role_ids": regional_role_ids,
+        "legacy_role_present": (
+            member.get_role(LEGACY_VERIFIED_ROLE_ID) is not None
+        ),
+    }
+    return reasons, signals
 
 
 def _json_value(value, default):
@@ -171,9 +231,22 @@ def _stored_vpn_summary(provider_results, checked_at=None) -> str:
 
 def _attempt_flow_label(signals) -> str:
     signals = _json_value(signals, {})
-    if isinstance(signals, dict) and signals.get("flow_mode") == "direct_oauth":
-        return "Verificación directa por DM"
+    if isinstance(signals, dict):
+        if signals.get("flow_mode") == "direct_oauth":
+            return "Verificación directa por DM"
+        if signals.get("flow_mode") == "forced_manual":
+            return "Forzada por staff"
     return "Panel web"
+
+
+def _attempt_manual_provider(signals) -> str | None:
+    signals = _json_value(signals, {})
+    if not isinstance(signals, dict):
+        return None
+    provider = signals.get("manual_provider")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    return discord.utils.escape_markdown(provider.strip()[:100])
 
 
 class PersonalVerificationLinkView(discord.ui.View):
@@ -582,7 +655,7 @@ class VerificationManager:
             content = (
                 "🗒️ Su solicitud de Verificación se envió a revisión. "
                 "Cuando sea aceptada recibirá el Rol "
-                f"<@&{VERIFIED_ROLE_ID}>. Agradecemos su paciencia."
+                f"{VERIFIED_ROLE_DISPLAY}. Agradecemos su paciencia."
             )
         elif outcome == "retry":
             content = (
@@ -804,7 +877,7 @@ class VerificationManager:
         if accepted:
             content = (
                 "Tu solicitud de Verificación fue aceptada y ya recibiste "
-                f"el rol <@&{VERIFIED_ROLE_ID}>."
+                f"el rol {VERIFIED_ROLE_DISPLAY}."
             )
         elif regional_rejection:
             content = "Região incorreta. Verificação recusada."
@@ -982,6 +1055,13 @@ class VerificationManager:
         }
         decision = str(row["decision"] or "pending")
         risk_level = str(row["risk_level"] or "pending").upper()
+        flow_label = _attempt_flow_label(row["signals"])
+        manual_provider = _attempt_manual_provider(row["signals"])
+        risk_display = (
+            "NO EVALUADO"
+            if flow_label == "Forzada por staff"
+            else f"{risk_level} ({row['risk_score']}/100)"
+        )
         role_status = role_labels.get(
             str(row["role_delivery_status"] or "not_required"),
             "Desconocido",
@@ -1045,7 +1125,7 @@ class VerificationManager:
         )
         embed.add_field(
             name="Riesgo",
-            value=f"{risk_level} ({row['risk_score']}/100)",
+            value=risk_display,
             inline=True,
         )
         embed.add_field(
@@ -1055,9 +1135,15 @@ class VerificationManager:
         )
         embed.add_field(
             name="Flujo",
-            value=_attempt_flow_label(row["signals"]),
+            value=flow_label,
             inline=True,
         )
+        if manual_provider is not None:
+            embed.add_field(
+                name="Proveedor informado",
+                value=manual_provider,
+                inline=True,
+            )
         embed.add_field(
             name="Rol verificado",
             value=role_status,
@@ -1571,6 +1657,128 @@ def setup(bot):
             f"Solicitud de verificación directa enviada por DM a {usuario.mention}.",
             ephemeral=True,
         )
+
+    @bot.tree.command(
+        name="forzar_verificacion",
+        description="(Staff) Registra y entrega una verificación manual.",
+    )
+    @require_staff()
+    @discord.app_commands.describe(
+        usuario="Miembro que será verificado manualmente.",
+        pais="Código ISO de dos letras, por ejemplo CU, CO o BR.",
+        proveedor="Proveedor de Internet informado, sin incluir una IP.",
+    )
+    async def forzar_verificacion(
+        interaction: discord.Interaction,
+        usuario: discord.Member,
+        pais: str,
+        proveedor: str,
+    ):
+        if interaction.guild is None or interaction.guild.id != GUILD_ID:
+            await interaction.response.send_message(
+                "Este comando solo está disponible en el servidor configurado.",
+                ephemeral=True,
+            )
+            return
+        if get_configuration_errors():
+            await interaction.response.send_message(
+                "La verificación no está disponible temporalmente.",
+                ephemeral=True,
+            )
+            return
+        if database.bot_pool is None:
+            await interaction.response.send_message(
+                DB_NO_DISPONIBLE,
+                ephemeral=True,
+            )
+            return
+        if usuario.bot:
+            await interaction.response.send_message(
+                "No se puede verificar una cuenta de bot.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            country_code = _normalize_country_code(pais)
+            provider_name = _normalize_provider(proveedor)
+        except ValueError as exc:
+            await interaction.response.send_message(
+                str(exc),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        current_time = datetime.now(timezone.utc)
+        risk_reasons, discord_signals = _forced_discord_observations(
+            usuario,
+            now=current_time,
+        )
+        try:
+            attempt, created = await database.record_forced_verification_attempt(
+                guild_id=interaction.guild.id,
+                user_id=usuario.id,
+                discord_tag=str(usuario)[:128],
+                country_code=country_code,
+                provider=provider_name,
+                reviewed_by=interaction.user.id,
+                risk_reasons=risk_reasons,
+                signals=discord_signals,
+                retention_until=(
+                    current_time + timedelta(days=DATA_RETENTION_DAYS)
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "No se pudo registrar la verificación forzada de %s.",
+                usuario.id,
+            )
+            await interaction.followup.send(
+                "No fue posible registrar la verificación manual.",
+                ephemeral=True,
+            )
+            return
+
+        attempt_id = int(attempt["id"])
+        try:
+            delivery_result = await verification.process_pending_role_delivery(
+                attempt_id
+            )
+        except Exception:
+            logger.exception(
+                "No se pudo procesar inmediatamente la verificación forzada %s.",
+                attempt_id,
+            )
+            delivery_result = "pending"
+
+        logger.warning(
+            (
+                "Verificación forzada registrada | staff=%s | usuario=%s | "
+                "intento=%s | nuevo=%s | entrega=%s"
+            ),
+            interaction.user.id,
+            usuario.id,
+            attempt_id,
+            created,
+            delivery_result,
+        )
+        if delivery_result == "granted":
+            result_text = (
+                f"Verificación manual completada para {usuario.mention}. "
+                "El rol antiguo fue retirado si estaba presente."
+            )
+        elif created:
+            result_text = (
+                f"Verificación manual registrada para {usuario.mention}. "
+                "La entrega del rol quedó en la cola automática de reintentos."
+            )
+        else:
+            result_text = (
+                f"{usuario.mention} ya tenía una entrega de rol en proceso "
+                f"(verificación interna `{attempt_id}`)."
+            )
+        await interaction.followup.send(result_text, ephemeral=True)
 
     @bot.tree.command(
         name="usuarios_verificados",

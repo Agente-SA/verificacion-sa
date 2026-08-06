@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS verification_attempts (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     discord_tag TEXT,
-    ip_hash CHAR(64) NOT NULL,
+    ip_hash CHAR(64),
     ip_network_hash CHAR(64),
     fingerprint_hash CHAR(64),
     country_code VARCHAR(2),
@@ -234,6 +234,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS verification_tokens_one_active_user_uidx
     WHERE status IN ('issued', 'in_progress');
 ALTER TABLE verification_oauth_sessions
     ALTER COLUMN initial_ip_hash DROP NOT NULL;
+ALTER TABLE verification_attempts
+    ALTER COLUMN ip_hash DROP NOT NULL;
 ALTER TABLE verification_attempts
     ADD COLUMN IF NOT EXISTS tor_detected BOOLEAN,
     ADD COLUMN IF NOT EXISTS datacenter_detected BOOLEAN,
@@ -945,6 +947,92 @@ async def record_pending_verification_attempt(
                 provider_results_json,
                 vpn_checked_at,
             )
+
+
+async def record_forced_verification_attempt(
+    *,
+    guild_id,
+    user_id,
+    discord_tag,
+    country_code,
+    provider,
+    reviewed_by,
+    risk_reasons,
+    signals,
+    retention_until,
+):
+    reasons_json = json.dumps(
+        risk_reasons,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    signals_json = json.dumps(
+        {
+            **signals,
+            "flow_mode": "forced_manual",
+            "manual_provider": provider,
+            "network_evaluated": False,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    async with _pool().acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock($1::BIGINT)",
+                user_id,
+            )
+            active = await conn.fetchrow(
+                """
+                SELECT *
+                FROM verification_attempts
+                WHERE guild_id=$1
+                  AND user_id=$2
+                  AND role_delivery_status IN (
+                      'approved_pending_role', 'processing'
+                  )
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                guild_id,
+                user_id,
+            )
+            if active is not None:
+                return active, False
+
+            row = await conn.fetchrow(
+                """
+                INSERT INTO verification_attempts (
+                    guild_id, user_id, discord_tag, ip_hash,
+                    ip_network_hash, fingerprint_hash, country_code,
+                    vpn_check_status, vpn_provider_results,
+                    risk_score, risk_level, decision, role_granted,
+                    role_delivery_status, role_next_retry_at,
+                    manual_review_required, manual_review_status,
+                    reviewed_by, reviewed_at, risk_reasons,
+                    signals, retention_until
+                )
+                VALUES (
+                    $1, $2, $3, NULL, NULL, NULL, $4,
+                    'not_evaluated', '{}'::jsonb,
+                    0, 'pending', 'pending', FALSE,
+                    'approved_pending_role', CURRENT_TIMESTAMP,
+                    TRUE, 'accepted', $5, CURRENT_TIMESTAMP,
+                    $6::jsonb, $7::jsonb, $8
+                )
+                RETURNING *
+                """,
+                guild_id,
+                user_id,
+                discord_tag,
+                country_code,
+                reviewed_by,
+                reasons_json,
+                signals_json,
+                retention_until,
+            )
+            return row, True
 
 
 async def get_verification_match_candidates(

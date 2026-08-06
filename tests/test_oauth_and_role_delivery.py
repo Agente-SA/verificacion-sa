@@ -26,7 +26,12 @@ try:
     from core.verification_risk import RiskAssessment
     from modules.verificacion import (
         VerificationManager,
+        _attempt_manual_provider,
+        _attempt_flow_label,
         _attempt_regional_review_role_ids,
+        _forced_discord_observations,
+        _normalize_country_code,
+        _normalize_provider,
         _stored_vpn_summary,
     )
 except ModuleNotFoundError as exc:
@@ -230,6 +235,23 @@ class RoleDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "Tu cuenta ha sido Verificada con Éxito ✅",
             ephemeral=False,
         )
+
+    async def test_review_dm_uses_a_plain_role_label(self):
+        followup = SimpleNamespace(send=AsyncMock())
+        interaction = SimpleNamespace(guild=None, followup=followup)
+        manager = VerificationManager(SimpleNamespace())
+        manager.remember_result_interaction("token-id", 2, interaction)
+
+        delivered = await manager.send_verification_result(
+            "token-id",
+            2,
+            "review",
+        )
+
+        self.assertTrue(delivered)
+        message = followup.send.await_args.args[0]
+        self.assertIn("**@Verificado-ES**", message)
+        self.assertNotIn("<@&", message)
 
     async def test_legacy_role_is_removed_when_present(self):
         legacy_role = SimpleNamespace(id=1409401827065204786)
@@ -445,6 +467,61 @@ class RegionalReviewTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GuardianUserQueryTests(unittest.TestCase):
+    def test_forced_verification_inputs_are_normalized(self):
+        self.assertEqual(_normalize_country_code(" cu "), "CU")
+        self.assertEqual(
+            _normalize_provider("  ETECSA   Móvil "),
+            "ETECSA Móvil",
+        )
+        with self.assertRaises(ValueError):
+            _normalize_country_code("Cuba")
+        with self.assertRaises(ValueError):
+            _normalize_provider(" ")
+
+    def test_forced_verification_uses_discord_observations_only(self):
+        legacy_role = SimpleNamespace(id=1409401827065204786)
+        regional_role = SimpleNamespace(id=1328006434847195208)
+        member = SimpleNamespace(
+            created_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            joined_at=datetime(2026, 7, 25, tzinfo=timezone.utc),
+            roles=[legacy_role, regional_role],
+        )
+        member.get_role = lambda role_id: next(
+            (role for role in member.roles if role.id == role_id),
+            None,
+        )
+
+        reasons, signals = _forced_discord_observations(
+            member,
+            now=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        )
+
+        self.assertIn(
+            "Verificación forzada por staff; análisis de red no realizado.",
+            reasons,
+        )
+        self.assertIn(
+            "Cuenta de Discord creada hace menos de 30 días.",
+            reasons,
+        )
+        self.assertIn(
+            "Ingreso al servidor hace menos de 30 días.",
+            reasons,
+        )
+        self.assertEqual(
+            signals["regional_review_role_ids"],
+            [1328006434847195208],
+        )
+        self.assertTrue(signals["legacy_role_present"])
+
+    def test_forced_flow_and_provider_are_identified(self):
+        signals = {
+            "flow_mode": "forced_manual",
+            "manual_provider": "ETECSA Móvil",
+        }
+        self.assertEqual(_attempt_flow_label(signals), "Forzada por staff")
+        self.assertEqual(_attempt_manual_provider(signals), "ETECSA Móvil")
+
     def test_stored_provider_results_are_rendered_for_staff(self):
         summary = _stored_vpn_summary(
             {
@@ -501,6 +578,39 @@ class GuardianUserQueryTests(unittest.TestCase):
         self.assertIn("Rango de red coincidente", fields["Coincidencias"])
         self.assertIn("**ACEPTADA** por <@123>", fields["Resolución"])
         self.assertEqual(fields["Verificación interna"], "`29`")
+
+    def test_user_guardian_embed_marks_forced_verification_as_not_evaluated(self):
+        row = {
+            "id": 30,
+            "country_code": "CU",
+            "risk_score": 0,
+            "risk_level": "pending",
+            "decision": "approved",
+            "role_granted": True,
+            "role_delivery_status": "granted",
+            "possible_main_user_id": None,
+            "manual_review_status": "accepted",
+            "reviewed_by": 123,
+            "reviewed_at": datetime(2026, 8, 5, 12, 5, tzinfo=timezone.utc),
+            "risk_reasons": [
+                "Verificación forzada por staff; análisis de red no realizado."
+            ],
+            "vpn_provider_results": {},
+            "vpn_checked_at": None,
+            "signals": {
+                "flow_mode": "forced_manual",
+                "manual_provider": "ETECSA",
+            },
+            "created_at": datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc),
+        }
+        member = SimpleNamespace(id=2, mention="<@2>")
+
+        embed = VerificationManager.user_guardian_embed(member, row)
+        fields = {field.name: field.value for field in embed.fields}
+
+        self.assertEqual(fields["Flujo"], "Forzada por staff")
+        self.assertEqual(fields["Riesgo"], "NO EVALUADO")
+        self.assertEqual(fields["Proveedor informado"], "ETECSA")
 
 
 if __name__ == "__main__":
