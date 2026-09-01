@@ -471,7 +471,7 @@ async def init_db() -> None:
         raise
 
     bot_pool = pool
-    print("Conexión a Neon PostgreSQL exitosa y tablas verificadas.")
+    print("Conexión a PostgreSQL exitosa y tablas verificadas.")
     if any(cleanup.values()):
         print(
             "Retención inicial aplicada: "
